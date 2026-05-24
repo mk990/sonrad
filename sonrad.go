@@ -29,6 +29,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -41,11 +42,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -56,22 +59,27 @@ var version = "dev" // overridden at build time via -ldflags "-X main.version=..
 // ------------------------------------------------------------------
 
 var (
-	flagAddr        = flag.String("addr", ":8910", "HTTP listen address")
-	flagDownloadDir = flag.String("download-dir", "./downloads", "directory finished files end up in")
-	flagAPIKey      = flag.String("api-key", "", "API key Sonarr/Radarr must present (auto-generated if empty)")
-	flagMaxConc     = flag.Int("max-concurrent", 3, "max concurrent file downloads")
-	flagRateLimit   = flag.Int64("rate-limit", 0, "aggregate bytes/sec cap (0 = unlimited)")
-	flagUA          = flag.String("user-agent", "Mozilla/5.0 (X11; Linux x86_64) sonrad/"+version, "HTTP User-Agent for upstream")
-	flagCookies     = flag.String("cookies", "", "raw Cookie header for upstream requests")
-	flagBase        = flag.String("base-url", "https://azfilm.theazizi.ir", "azfilm base URL")
-	flagCacheTTL    = flag.Duration("cache-ttl", 10*time.Minute, "indexer scrape cache TTL")
-	flagPubHost     = flag.String("public-host", "", "host[:port] used in indexer callback links (default: from request Host header)")
-	flagDebug       = flag.Bool("debug", false, "verbose logging")
-	flagTestIMDB    = flag.String("test", "", "scrape this IMDB id, print results, exit")
+	flagAddr            = flag.String("addr", ":8910", "HTTP listen address")
+	flagDownloadDir     = flag.String("download-dir", "./downloads", "directory finished files end up in")
+	flagAPIKey          = flag.String("api-key", "", "API key Sonarr/Radarr must present (auto-generated if empty)")
+	flagMaxConc         = flag.Int("max-concurrent", 3, "max concurrent file downloads")
+	flagRateLimit       = flag.Int64("rate-limit", 0, "aggregate bytes/sec cap (0 = unlimited)")
+	flagUA              = flag.String("user-agent", "Mozilla/5.0 (X11; Linux x86_64) sonrad/"+version, "HTTP User-Agent for upstream")
+	flagCookies         = flag.String("cookies", "", "raw Cookie header for upstream requests")
+	flagBase            = flag.String("base-url", "https://azfilm.theazizi.ir", "azfilm base URL")
+	flagCacheTTL        = flag.Duration("cache-ttl", 10*time.Minute, "indexer scrape cache TTL")
+	flagPubHost         = flag.String("public-host", "", "host[:port] used in indexer callback links (default: from request Host header)")
+	flagDebug           = flag.Bool("debug", false, "verbose logging")
+	flagTestIMDB        = flag.String("test", "", "scrape this IMDB id, print results, exit")
+	flagStateFile       = flag.String("state-file", "", "path to JSON state file for queue/history persistence (default: <download-dir>/sonrad.state.json)")
+	flagInsecure        = flag.Bool("insecure-skip-verify", false, "skip TLS verification on upstream requests (for mirrors with bad certs)")
+	flagShutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "how long to wait for in-flight requests during shutdown")
+	flagRetries         = flag.Int("download-retries", 3, "attempts per file before marking it failed (1 = no retry)")
+	flagSearchConc      = flag.Int("search-concurrency", 4, "parallel upstream fetches per indexer search")
 )
 
 var (
-	httpClient = &http.Client{Timeout: 90 * time.Second}
+	httpClient *http.Client
 	mgr        *Manager
 	scrapeC    = &cache{m: map[string]cacheEntry{}}
 )
@@ -94,6 +102,39 @@ type Job struct {
 	StoragePath string
 	FailMessage string
 	Files       []*JobFile
+
+	// transient (not persisted — lowercase keeps json.Marshal away from them)
+	speedBPS        float64
+	lastSampleAt    time.Time
+	lastSampleBytes int64
+}
+
+// recordProgress is called whenever `n` more bytes have been pulled for `f`.
+// Updates the job and file counters and refreshes an EWMA byte-rate that
+// drives the SAB queue's speed / timeleft fields.
+func (j *Job) recordProgress(f *JobFile, n int64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if f != nil {
+		f.BytesDone += n
+	}
+	j.BytesDone += n
+
+	now := time.Now()
+	if j.lastSampleAt.IsZero() {
+		j.lastSampleAt = now
+		j.lastSampleBytes = j.BytesDone
+		return
+	}
+	elapsed := now.Sub(j.lastSampleAt).Seconds()
+	if elapsed < 0.5 {
+		return
+	}
+	instant := float64(j.BytesDone-j.lastSampleBytes) / elapsed
+	const alpha = 0.3
+	j.speedBPS = alpha*instant + (1-alpha)*j.speedBPS
+	j.lastSampleAt = now
+	j.lastSampleBytes = j.BytesDone
 }
 
 type JobFile struct {
@@ -112,9 +153,14 @@ type Manager struct {
 	sem       chan struct{}
 	rateLimit int64
 	ctx       context.Context
+
+	stateFile string
+	dirty     int32 // accessed via sync/atomic via a small helper; using int32 not atomic.Bool to avoid bumping go-version requirements
+	dirtyMu   sync.Mutex
+	wg        sync.WaitGroup // counts in-flight runJob goroutines
 }
 
-func NewManager(ctx context.Context, maxConc int, rateLimit int64) *Manager {
+func NewManager(ctx context.Context, maxConc int, rateLimit int64, stateFile string) *Manager {
 	if maxConc < 1 {
 		maxConc = 1
 	}
@@ -122,14 +168,26 @@ func NewManager(ctx context.Context, maxConc int, rateLimit int64) *Manager {
 		sem:       make(chan struct{}, maxConc),
 		rateLimit: rateLimit,
 		ctx:       ctx,
+		stateFile: stateFile,
 	}
+}
+
+func (m *Manager) markDirty() {
+	m.dirtyMu.Lock()
+	m.dirty = 1
+	m.dirtyMu.Unlock()
 }
 
 func (m *Manager) Add(j *Job) {
 	m.mu.Lock()
 	m.queue = append(m.queue, j)
 	m.mu.Unlock()
-	go m.runJob(j)
+	m.markDirty()
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.runJob(j)
+	}()
 }
 
 func (m *Manager) Delete(id string) bool {
@@ -138,12 +196,14 @@ func (m *Manager) Delete(id string) bool {
 	for i, j := range m.queue {
 		if j.ID == id {
 			m.queue = append(m.queue[:i], m.queue[i+1:]...)
+			m.markDirty()
 			return true
 		}
 	}
 	for i, j := range m.history {
 		if j.ID == id {
 			m.history = append(m.history[:i], m.history[i+1:]...)
+			m.markDirty()
 			return true
 		}
 	}
@@ -180,6 +240,95 @@ func (m *Manager) finalize(j *Job, ok bool, errMsg string) {
 	if len(m.history) > 500 {
 		m.history = m.history[:500]
 	}
+	m.markDirty()
+}
+
+// savedState is the on-disk JSON layout. We deliberately keep it tiny and
+// flat — humans should be able to read and edit it.
+type savedState struct {
+	Queue   []*Job `json:"queue"`
+	History []*Job `json:"history"`
+}
+
+func (m *Manager) saveStateNow() {
+	if m.stateFile == "" {
+		return
+	}
+	q, h := m.Snapshot()
+	data, err := json.MarshalIndent(savedState{Queue: q, History: h}, "", "  ")
+	if err != nil {
+		log.Printf("state save: marshal: %v", err)
+		return
+	}
+	tmp := m.stateFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		log.Printf("state save: write %s: %v", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, m.stateFile); err != nil {
+		log.Printf("state save: rename: %v", err)
+	}
+}
+
+func (m *Manager) saveLoop(ctx context.Context) {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			m.saveStateNow()
+			return
+		case <-t.C:
+			m.dirtyMu.Lock()
+			if m.dirty == 0 {
+				m.dirtyMu.Unlock()
+				continue
+			}
+			m.dirty = 0
+			m.dirtyMu.Unlock()
+			m.saveStateNow()
+		}
+	}
+}
+
+// loadState reads any persisted state, restores history, and re-queues any
+// jobs that were in flight (resume picks up via HTTP Range on next attempt).
+func (m *Manager) loadState() {
+	if m.stateFile == "" {
+		return
+	}
+	data, err := os.ReadFile(m.stateFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("state load: %v", err)
+		}
+		return
+	}
+	var st savedState
+	if err := json.Unmarshal(data, &st); err != nil {
+		log.Printf("state load: corrupt %s: %v (ignoring)", m.stateFile, err)
+		return
+	}
+	m.mu.Lock()
+	m.history = append(m.history, st.History...)
+	if len(m.history) > 500 {
+		m.history = m.history[:500]
+	}
+	m.mu.Unlock()
+	for _, j := range st.Queue {
+		// reset transient fields — speed restarts from 0, statuses re-driven by worker
+		j.speedBPS = 0
+		j.lastSampleAt = time.Time{}
+		j.lastSampleBytes = 0
+		j.Status = "Queued"
+		for _, f := range j.Files {
+			if f.Status == "downloading" {
+				f.Status = "pending"
+			}
+		}
+		m.Add(j)
+	}
+	log.Printf("state load: %d queued (resuming), %d history", len(st.Queue), len(st.History))
 }
 
 func (m *Manager) runJob(j *Job) {
@@ -205,11 +354,8 @@ func (m *Manager) runJob(j *Job) {
 		}
 		f.Status = "downloading"
 		dest := filepath.Join(storage, sanitizeFilename(f.Filename))
-		err := downloadFile(m.ctx, f.URL, dest, m.rateLimit, func(n int64) {
-			j.mu.Lock()
-			f.BytesDone += n
-			j.BytesDone += n
-			j.mu.Unlock()
+		err := downloadFileWithRetry(m.ctx, f.URL, dest, m.rateLimit, *flagRetries, func(n int64) {
+			j.recordProgress(f, n)
 		})
 		<-m.sem
 		if err != nil {
@@ -290,15 +436,24 @@ type FileEntry struct {
 }
 
 var (
-	reDirLink  = regexp.MustCompile(`(?is)class="[^"]*dl-quality-btn-dir[^"]*"\s+href="([^"]+)"`)
-	reTitle    = regexp.MustCompile(`(?is)<title>(.*?)</title>`)
-	reFile     = regexp.MustCompile(`(?is)<code><i[^>]*>([^<]+?\.(?:mkv|mp4|avi|m4v|mov|ts|wmv))</i></code>`)
-	reFileA    = regexp.MustCompile(`(?is)<a[^>]+href="([^"]+?\.(?:mkv|mp4|avi|m4v|mov|ts|wmv))"`)
-	reSizeCell = regexp.MustCompile(`(?is)class="[^"]*\bs\b[^"]*"[^>]*>\s*<code[^>]*>([^<]+?)</code>`)
-	reSizeAny  = regexp.MustCompile(`(?i)^\s*([\d.]+)\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB|K|M|G|T)?\s*$`)
-	reSE       = regexp.MustCompile(`(?i)S(\d{1,2})E(\d{1,4})`)
-	reSeason   = regexp.MustCompile(`(?i)/S(\d{1,2})/`)
-	reIMDB     = regexp.MustCompile(`tt\d{6,9}`)
+	reDirLink    = regexp.MustCompile(`(?is)class="[^"]*dl-quality-btn-dir[^"]*"\s+href="([^"]+)"`)
+	reTitle      = regexp.MustCompile(`(?is)<title>(.*?)</title>`)
+	reFile       = regexp.MustCompile(`(?is)<code><i[^>]*>([^<]+?\.(?:mkv|mp4|avi|m4v|mov|ts|wmv))</i></code>`)
+	reFileA      = regexp.MustCompile(`(?is)<a[^>]+href="([^"]+?\.(?:mkv|mp4|avi|m4v|mov|ts|wmv))"`)
+	reSizeCell   = regexp.MustCompile(`(?is)class="[^"]*\bs\b[^"]*"[^>]*>\s*<code[^>]*>([^<]+?)</code>`)
+	reSizeAny    = regexp.MustCompile(`(?i)^\s*([\d.]+)\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB|K|M|G|T)?\s*$`)
+	reSE         = regexp.MustCompile(`(?i)S(\d{1,2})E(\d{1,4})`)
+	reSeason     = regexp.MustCompile(`(?i)/S(\d{1,2})/`)
+	reIMDB       = regexp.MustCompile(`tt\d{6,9}`)
+	reSearchCard = regexp.MustCompile(`(?is)<a\s+class="card"\s+href="movie\.php\?imdb=(tt\d+)"[^>]*>(.*?)</a>`)
+	reCardType   = regexp.MustCompile(`(?is)class="ctype\s+(\w+)"`)
+	reCardTitle  = regexp.MustCompile(`(?is)<h2\s+class="ctitle">([^<]+)</h2>`)
+	// Strip Sonarr/Radarr release-style noise from a free-text query before
+	// shipping it to azfilm. Order matters: episode tokens first, then years.
+	reQueryEpisode = regexp.MustCompile(`(?i)\bs\d{1,2}(?:e\d{1,4})?\b`)
+	reQuerySeason  = regexp.MustCompile(`(?i)\bseason\s*\d{1,2}\b`)
+	reQueryYear    = regexp.MustCompile(`\b(19|20)\d{2}\b`)
+	reMultiSpace   = regexp.MustCompile(`\s+`)
 )
 
 func httpGetBytes(rawurl string) ([]byte, error) {
@@ -360,11 +515,73 @@ func scrapeMoviePage(imdb string) (title string, dirs []Directory, err error) {
 		seen[u] = true
 		dirs = append(dirs, parseDirURL(u))
 	}
-	scrapeC.Set(key, struct {
-		T string
-		D []Directory
-	}{title, dirs}, *flagCacheTTL)
+	if len(dirs) > 0 { // never cache a no-result scrape — likely transient
+		scrapeC.Set(key, struct {
+			T string
+			D []Directory
+		}{title, dirs}, *flagCacheTTL)
+	}
 	return title, dirs, nil
+}
+
+// SearchHit is one card from azfilm's /index.php?q= search results.
+type SearchHit struct {
+	IMDB  string
+	Title string
+	IsTV  bool
+}
+
+// searchByTitle queries azfilm's free-text search and returns one hit per card.
+func searchByTitle(q string) ([]SearchHit, error) {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return nil, nil
+	}
+	key := "search:" + q
+	if v, ok := scrapeC.Get(key); ok {
+		return v.([]SearchHit), nil
+	}
+	body, err := httpGetBytes(*flagBase + "/index.php?q=" + url.QueryEscape(q))
+	if err != nil {
+		return nil, err
+	}
+	s := string(body)
+	var hits []SearchHit
+	seen := map[string]bool{}
+	for _, m := range reSearchCard.FindAllStringSubmatch(s, -1) {
+		imdb := m[1]
+		if seen[imdb] {
+			continue
+		}
+		seen[imdb] = true
+		h := SearchHit{IMDB: imdb}
+		block := m[2]
+		if mm := reCardTitle.FindStringSubmatch(block); len(mm) > 1 {
+			h.Title = htmlUnescape(strings.TrimSpace(mm[1]))
+		}
+		if mm := reCardType.FindStringSubmatch(block); len(mm) > 1 {
+			h.IsTV = strings.EqualFold(mm[1], "tv")
+		}
+		hits = append(hits, h)
+	}
+	if len(hits) > 0 {
+		scrapeC.Set(key, hits, *flagCacheTTL)
+	}
+	return hits, nil
+}
+
+// cleanQuery strips Sonarr/Radarr release-style noise so azfilm's
+// natural-language search can match. e.g.
+//   "Alice.in.Borderland.S01E05" → "Alice in Borderland"
+//   "The.Matrix.1999"            → "The Matrix"
+func cleanQuery(q string) string {
+	q = strings.ReplaceAll(q, ".", " ")
+	q = strings.ReplaceAll(q, "_", " ")
+	q = reQueryEpisode.ReplaceAllString(q, "")
+	q = reQuerySeason.ReplaceAllString(q, "")
+	q = reQueryYear.ReplaceAllString(q, "")
+	q = reMultiSpace.ReplaceAllString(q, " ")
+	return strings.TrimSpace(q)
 }
 
 func parseDirURL(rawurl string) Directory {
@@ -473,7 +690,9 @@ func scrapeDirectory(dirURL string) ([]FileEntry, error) {
 		}
 	}
 
-	scrapeC.Set(key, files, *flagCacheTTL)
+	if len(files) > 0 {
+		scrapeC.Set(key, files, *flagCacheTTL)
+	}
 	return files, nil
 }
 
@@ -657,8 +876,22 @@ type indexerItem struct {
 	Episode  int
 }
 
+// maxTitleSearchCandidates caps how many movie pages we scrape per free-text
+// search. Each candidate triggers one movie-page fetch plus N directory-listing
+// fetches, so this protects azfilm from a thundering herd.
+const maxTitleSearchCandidates = 5
+
 func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 	q := r.URL.Query()
+	apikey := q.Get("apikey")
+	if apikey == "" {
+		apikey = r.Header.Get("X-Api-Key")
+	}
+	pub := publicBase(r)
+	wantSeason, _ := strconv.Atoi(q.Get("season"))
+	wantEp, _ := strconv.Atoi(q.Get("ep"))
+
+	// Resolve which IMDB ids to emit results for.
 	imdb := q.Get("imdbid")
 	if imdb == "" {
 		if m := reIMDB.FindString(q.Get("q")); m != "" {
@@ -668,29 +901,84 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 	if imdb != "" && !strings.HasPrefix(imdb, "tt") {
 		imdb = "tt" + imdb
 	}
-	if imdb == "" {
-		respondXML(w, renderFeed("sonrad", nil))
-		return
-	}
 
-	wantSeason, _ := strconv.Atoi(q.Get("season"))
-	wantEp, _ := strconv.Atoi(q.Get("ep"))
-
-	title, dirs, err := scrapeMoviePage(imdb)
-	if err != nil {
-		if *flagDebug {
-			log.Printf("scrape %s: %v", imdb, err)
+	var candidateIMDBs []string
+	if imdb != "" {
+		candidateIMDBs = []string{imdb}
+	} else if qstr := strings.TrimSpace(q.Get("q")); qstr != "" {
+		hits, err := searchByTitle(cleanQuery(qstr))
+		if err != nil {
+			if *flagDebug {
+				log.Printf("title search %q: %v", qstr, err)
+			}
 		}
+		for _, h := range hits {
+			switch mode {
+			case "movie":
+				if h.IsTV {
+					continue
+				}
+			case "tvsearch":
+				if !h.IsTV {
+					continue
+				}
+			}
+			candidateIMDBs = append(candidateIMDBs, h.IMDB)
+			if len(candidateIMDBs) >= maxTitleSearchCandidates {
+				break
+			}
+		}
+	}
+
+	if len(candidateIMDBs) == 0 {
 		respondXML(w, renderFeed("sonrad", nil))
 		return
 	}
 
-	apikey := q.Get("apikey")
-	if apikey == "" {
-		apikey = r.Header.Get("X-Api-Key")
+	// Fan out one scrape per candidate IMDB. With up to 5 candidates and ~16
+	// directories each that's 80+ HTTPs; serial would take many seconds.
+	type result struct {
+		title string
+		items []indexerItem
 	}
-	pub := publicBase(r)
+	results := make([]result, len(candidateIMDBs))
+	sem := make(chan struct{}, max(1, *flagSearchConc))
+	var wg sync.WaitGroup
+	for i, im := range candidateIMDBs {
+		wg.Add(1)
+		go func(i int, im string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			title, dirs, err := scrapeMoviePage(im)
+			if err != nil {
+				if *flagDebug {
+					log.Printf("scrape %s: %v", im, err)
+				}
+				return
+			}
+			results[i] = result{
+				title: title,
+				items: emitItemsForMovie(title, im, dirs, mode, wantSeason, wantEp, apikey, pub),
+			}
+		}(i, im)
+	}
+	wg.Wait()
 
+	var items []indexerItem
+	feedTitle := "sonrad"
+	for _, r := range results {
+		if feedTitle == "sonrad" && r.title != "" {
+			feedTitle = r.title
+		}
+		items = append(items, r.items...)
+	}
+	respondXML(w, renderFeed(feedTitle, items))
+}
+
+// emitItemsForMovie expands the directory list scraped from one IMDB page
+// into per-episode (+ season-pack) or per-movie indexer items.
+func emitItemsForMovie(title, imdb string, dirs []Directory, mode string, wantSeason, wantEp int, apikey, pub string) []indexerItem {
 	siteHasTV := false
 	for _, d := range dirs {
 		if d.Season > 0 {
@@ -699,9 +987,14 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 		}
 	}
 
-	var items []indexerItem
-	for _, d := range dirs {
-		// Decide whether this directory belongs in current search.
+	// Determine which directories survive the mode/season filter so we only
+	// pay for listings we'll actually use.
+	type relevantDir struct {
+		idx int
+		dir Directory
+	}
+	var relevant []relevantDir
+	for i, d := range dirs {
 		dirIsTV := d.Season > 0
 		switch mode {
 		case "movie":
@@ -716,12 +1009,40 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 		if wantSeason > 0 && d.Season != wantSeason {
 			continue
 		}
+		relevant = append(relevant, relevantDir{i, d})
+	}
 
-		files, ferr := scrapeDirectory(d.URL)
-		if ferr != nil {
-			if *flagDebug {
-				log.Printf("scrape dir %s: %v", d.URL, ferr)
-			}
+	// Fetch all surviving directory listings in parallel — these are the
+	// expensive HTTP calls and are independent of each other.
+	listings := make([][]FileEntry, len(relevant))
+	{
+		sem := make(chan struct{}, max(1, *flagSearchConc))
+		var wg sync.WaitGroup
+		for i, rd := range relevant {
+			wg.Add(1)
+			go func(i int, d Directory) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				files, err := scrapeDirectory(d.URL)
+				if err != nil {
+					if *flagDebug {
+						log.Printf("scrape dir %s: %v", d.URL, err)
+					}
+					return
+				}
+				listings[i] = files
+			}(i, rd.dir)
+		}
+		wg.Wait()
+	}
+
+	var items []indexerItem
+	for i, rd := range relevant {
+		d := rd.dir
+		dirIsTV := d.Season > 0
+		files := listings[i]
+		if files == nil {
 			continue
 		}
 
@@ -820,7 +1141,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 		}
 	}
 
-	respondXML(w, renderFeed(title, items))
+	return items
 }
 
 func categoryFor(kind string, d Directory) int {
@@ -1140,11 +1461,20 @@ func sabQueue(w http.ResponseWriter, r *http.Request) {
 	queue, _ := mgr.Snapshot()
 	slots := make([]map[string]any, 0, len(queue))
 	var totalBytes, totalDone int64
+	var totalSpeed float64
 	for i, j := range queue {
 		j.mu.Lock()
 		left := j.Bytes - j.BytesDone
 		if left < 0 {
 			left = 0
+		}
+		jobLeft := j.Bytes - j.BytesDone
+		if jobLeft < 0 {
+			jobLeft = 0
+		}
+		var jobETA string = "0:00:00"
+		if j.speedBPS > 0 {
+			jobETA = formatHMS(int64(float64(jobLeft) / j.speedBPS))
 		}
 		slot := map[string]any{
 			"status":        j.Status,
@@ -1159,7 +1489,9 @@ func sabQueue(w http.ResponseWriter, r *http.Request) {
 			"size":          bytesString(j.Bytes),
 			"sizeleft":      bytesString(left),
 			"percentage":    percentage(j.BytesDone, j.Bytes),
-			"timeleft":      "0:00:00",
+			"timeleft":      jobETA,
+			"kbpersec":      fmt.Sprintf("%.1f", j.speedBPS/1024),
+			"mbpersec":      fmt.Sprintf("%.3f", j.speedBPS/(1024*1024)),
 			"priority":      "Normal",
 			"script":        "None",
 			"labels":        []string{},
@@ -1169,12 +1501,17 @@ func sabQueue(w http.ResponseWriter, r *http.Request) {
 		}
 		totalBytes += j.Bytes
 		totalDone += j.BytesDone
+		totalSpeed += j.speedBPS
 		j.mu.Unlock()
 		slots = append(slots, slot)
 	}
 	left := totalBytes - totalDone
 	if left < 0 {
 		left = 0
+	}
+	timeLeft := "0:00:00"
+	if totalSpeed > 0 {
+		timeLeft = formatHMS(int64(float64(left) / totalSpeed))
 	}
 	writeJSON(w, 200, map[string]any{
 		"queue": map[string]any{
@@ -1186,9 +1523,9 @@ func sabQueue(w http.ResponseWriter, r *http.Request) {
 			"start":           0,
 			"mb":              bytesToMB(totalBytes),
 			"mbleft":          bytesToMB(left),
-			"speed":           "0",
-			"kbpersec":        "0.0",
-			"timeleft":        "0:00:00",
+			"speed":           fmt.Sprintf("%.1f K", totalSpeed/1024),
+			"kbpersec":        fmt.Sprintf("%.1f", totalSpeed/1024),
+			"timeleft":        timeLeft,
 			"slots":           slots,
 			"diskspace1":      "1000.0",
 			"diskspace2":      "1000.0",
@@ -1197,6 +1534,20 @@ func sabQueue(w http.ResponseWriter, r *http.Request) {
 			"version":         "4.1.0",
 		},
 	})
+}
+
+// formatHMS renders seconds as H:MM:SS for SAB queue/history fields.
+func formatHMS(secs int64) string {
+	if secs < 0 {
+		secs = 0
+	}
+	if secs > 99*3600 { // SAB caps display at "99:59:59" — bigger values look broken in arr UIs
+		secs = 99 * 3600
+	}
+	h := secs / 3600
+	m := (secs / 60) % 60
+	s := secs % 60
+	return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 }
 
 func sabHistory(w http.ResponseWriter, r *http.Request) {
@@ -1402,6 +1753,57 @@ func startJob(t Token) (*Job, error) {
 // File downloader (resume + rate-limit)
 // ------------------------------------------------------------------
 
+// permanentDownloadError reports whether a downloadFile error is worth
+// retrying. We only treat 4xx (except 408/429) as permanent. Anything else
+// — network errors, 5xx, timeouts — gets retried.
+func permanentDownloadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, code := range []string{"400", "401", "403", "404", "405", "410", "451"} {
+		if strings.Contains(s, "HTTP "+code) {
+			return true
+		}
+	}
+	return false
+}
+
+// downloadFileWithRetry calls downloadFile up to `attempts` times with
+// exponential backoff. Resume via HTTP Range means each retry continues from
+// the bytes already on disk, so retries are cheap.
+func downloadFileWithRetry(ctx context.Context, urlStr, dest string, rateLimit int64, attempts int, onProgress func(int64)) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	backoff := time.Second
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		err := downloadFile(ctx, urlStr, dest, rateLimit, onProgress)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if permanentDownloadError(err) || ctx.Err() != nil {
+			return err
+		}
+		if attempt == attempts {
+			break
+		}
+		log.Printf("download %s attempt %d/%d failed: %v (retrying in %s)", dest, attempt, attempts, err, backoff)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+	}
+	return lastErr
+}
+
 func downloadFile(ctx context.Context, urlStr, dest string, rateLimit int64, onProgress func(int64)) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
@@ -1421,7 +1823,9 @@ func downloadFile(ctx context.Context, urlStr, dest string, rateLimit int64, onP
 	if startAt > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startAt))
 	}
-	client := &http.Client{Timeout: 0}
+	// reuse the shared transport (honors -insecure-skip-verify) but bypass the
+	// short timeout we set for scrape requests — downloads can take hours.
+	client := &http.Client{Transport: httpClient.Transport}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -1648,8 +2052,39 @@ func htmlEscMin(s string) string {
 // Main
 // ------------------------------------------------------------------
 
+// handleHealthz is a tiny liveness/readiness probe for Docker HEALTHCHECK,
+// kubernetes probes, and uptime monitors.
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	queue, history := mgr.Snapshot()
+	writeJSON(w, 200, map[string]any{
+		"status":          "ok",
+		"version":         version,
+		"queue_length":    len(queue),
+		"history_length":  len(history),
+	})
+}
+
+// initHTTPClient builds the shared upstream client. Done in main() rather
+// than at package init time so the flags are parsed first.
+func initHTTPClient() {
+	tr := &http.Transport{
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          32,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	if *flagInsecure {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		log.Printf("WARNING: TLS verification disabled for upstream requests")
+	}
+	httpClient = &http.Client{Timeout: 90 * time.Second, Transport: tr}
+}
+
 func main() {
 	flag.Parse()
+
+	initHTTPClient()
 
 	if *flagTestIMDB != "" {
 		testScrape(*flagTestIMDB)
@@ -1668,10 +2103,17 @@ func main() {
 	if abs, err := filepath.Abs(*flagDownloadDir); err == nil {
 		*flagDownloadDir = abs
 	}
+	if *flagStateFile == "" {
+		*flagStateFile = filepath.Join(*flagDownloadDir, "sonrad.state.json")
+	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// Root context cancelled on SIGINT/SIGTERM — workers honor it.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	mgr = NewManager(ctx, *flagMaxConc, *flagRateLimit)
+
+	mgr = NewManager(ctx, *flagMaxConc, *flagRateLimit, *flagStateFile)
+	mgr.loadState()
+	go mgr.saveLoop(ctx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api", handleAPI)
@@ -1679,23 +2121,61 @@ func main() {
 	mux.HandleFunc("/getnzb", handleGetNZB)
 	mux.HandleFunc("/sabnzbd/api", handleSABnzbd)
 	mux.HandleFunc("/sabnzbd/api/", handleSABnzbd)
+	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/", indexPage)
-
-	log.Printf("sonrad %s listening on %s", version, *flagAddr)
-	log.Printf("download dir: %s", *flagDownloadDir)
-	log.Printf("api key: %s", *flagAPIKey)
-	log.Printf("max concurrent: %d, rate limit: %d B/s", *flagMaxConc, *flagRateLimit)
-	log.Printf("Newznab indexer URL: http://<host>%s/api  (apikey: %s)", *flagAddr, *flagAPIKey)
-	log.Printf("SABnzbd base URL  : http://<host>%s/sabnzbd  (apikey: %s)", *flagAddr, *flagAPIKey)
 
 	srv := &http.Server{
 		Addr:              *flagAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
+
+	log.Printf("sonrad %s listening on %s", version, *flagAddr)
+	log.Printf("download dir: %s", *flagDownloadDir)
+	log.Printf("state file:   %s", *flagStateFile)
+	log.Printf("api key:      %s", *flagAPIKey)
+	log.Printf("concurrency:  %d files, %d search, rate-limit %d B/s, retries %d",
+		*flagMaxConc, *flagSearchConc, *flagRateLimit, *flagRetries)
+	log.Printf("Newznab indexer URL: http://<host>%s/api  (apikey: %s)", *flagAddr, *flagAPIKey)
+	log.Printf("SABnzbd base URL   : http://<host>%s/sabnzbd  (apikey: %s)", *flagAddr, *flagAPIKey)
+
+	// Run the server in a goroutine so we can react to ctx cancellation.
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("shutdown signal received, draining (timeout %s)…", *flagShutdownTimeout)
+	case err := <-errCh:
+		log.Printf("server error: %v", err)
 	}
+
+	// 1. stop accepting new HTTP requests, drain in-flight ones
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), *flagShutdownTimeout)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v", err)
+	}
+
+	// 2. wait for download workers (ctx is already cancelled, they're aborting)
+	done := make(chan struct{})
+	go func() {
+		mgr.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-shutdownCtx.Done():
+		log.Printf("workers didn't drain in time, forcing exit")
+	}
+
+	// 3. final state flush so a restart picks up where we left off
+	mgr.saveStateNow()
+	log.Printf("bye")
 }
 
 func testScrape(imdb string) {
