@@ -931,7 +931,24 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 	}
 
 	if len(candidateIMDBs) == 0 {
-		respondXML(w, renderFeed("sonrad", nil))
+		// Sonarr/Radarr's indexer Test sends an empty query; an empty feed trips
+		// the "no results in configured categories" warning that blocks Save in
+		// some versions. Emit a single placeholder in the right top-level
+		// category so the test sees a result. The title won't match Sonarr's
+		// release parser, so RSS sync skips it.
+		cat := 5000
+		if mode == "movie" {
+			cat = 2000
+		}
+		placeholder := indexerItem{
+			Title:    "sonrad bridge ready — searches require IMDB id",
+			GUID:     "sonrad-placeholder",
+			Link:     pub + "/getnzb?token=placeholder&apikey=" + url.QueryEscape(apikey),
+			PubDate:  time.Unix(0, 0),
+			Size:     1,
+			Category: cat,
+		}
+		respondXML(w, renderFeed("sonrad", []indexerItem{placeholder}))
 		return
 	}
 
