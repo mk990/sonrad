@@ -76,6 +76,7 @@ var (
 	flagShutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "how long to wait for in-flight requests during shutdown")
 	flagRetries         = flag.Int("download-retries", 3, "attempts per file before marking it failed (1 = no retry)")
 	flagSearchConc      = flag.Int("search-concurrency", 4, "parallel upstream fetches per indexer search")
+	flagNoDubbed        = flag.Bool("no-dubbed", false, "exclude Dubbed audio variants from indexer results")
 )
 
 var (
@@ -1024,6 +1025,9 @@ func emitItemsForMovie(title, imdb string, dirs []Directory, mode string, wantSe
 			}
 		}
 		if wantSeason > 0 && d.Season != wantSeason {
+			continue
+		}
+		if *flagNoDubbed && d.Audio == "Dubbed" {
 			continue
 		}
 		relevant = append(relevant, relevantDir{i, d})

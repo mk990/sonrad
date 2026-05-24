@@ -9,13 +9,12 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 
 # --- runtime stage ---
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata && \
+RUN apk add --no-cache ca-certificates tzdata su-exec shadow && \
     addgroup -S sonrad && adduser -S -G sonrad -H -h /app sonrad && \
     mkdir -p /downloads && chown sonrad:sonrad /downloads
 
 COPY --from=build /out/sonrad /usr/local/bin/sonrad
 
-USER sonrad
 WORKDIR /app
 
 EXPOSE 8910
@@ -30,9 +29,21 @@ ENV SONRAD_ADDR=:8910 \
     SONRAD_COOKIES="" \
     SONRAD_BASE_URL="https://azfilm.theazizi.ir" \
     SONRAD_CACHE_TTL=10m \
-    SONRAD_PUBLIC_HOST=""
+    SONRAD_PUBLIC_HOST="" \
+    SONRAD_NO_DUBBED=false \
+    PUID=1000 \
+    PGID=1000
 
-ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/sonrad \
+ENTRYPOINT ["/bin/sh", "-c", "\
+if [ \"$(id -u)\" = 0 ]; then \
+  groupmod -o -g \"$PGID\" sonrad && \
+  usermod  -o -u \"$PUID\" -g \"$PGID\" sonrad && \
+  chown sonrad:sonrad /downloads && \
+  RUN='su-exec sonrad'; \
+else \
+  RUN=''; \
+fi; \
+exec $RUN /usr/local/bin/sonrad \
     -addr \"$SONRAD_ADDR\" \
     -download-dir \"$SONRAD_DOWNLOAD_DIR\" \
     -api-key \"$SONRAD_API_KEY\" \
@@ -43,4 +54,5 @@ ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/sonrad \
     -base-url \"$SONRAD_BASE_URL\" \
     -cache-ttl \"$SONRAD_CACHE_TTL\" \
     -public-host \"$SONRAD_PUBLIC_HOST\" \
+    -no-dubbed=\"$SONRAD_NO_DUBBED\" \
     \"$@\"", "--"]
