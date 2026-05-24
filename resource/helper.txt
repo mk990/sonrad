@@ -1,0 +1,83 @@
+https://azfilm.theazizi.ir/movie.php?imdb=tt10795658
+
+curl -s https://azfilm.theazizi.ir/movie.php?imdb=tt10795658 | htmlq '.dl-quality-btn-dir'
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls3.iran-onemovies-dcenter.com/DonyayeSerial/series4/tt10795658/SoftSub/S01/1080p.x265.10bit.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/SoftSub/S01/720p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/SoftSub/S01/720p.x265.10bit.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls3.iran-onemovies-dcenter.com/DonyayeSerial/series4/tt10795658/SoftSub/S01/480p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls3.iran-onemovies-dcenter.com/DonyayeSerial/series4/tt10795658/SoftSub/S02/1080p.x265.10bit.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/SoftSub/S02/720p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/SoftSub/S02/720p.x265.10bit.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls3.iran-onemovies-dcenter.com/DonyayeSerial/series4/tt10795658/SoftSub/S02/480p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/SoftSub/S03/720p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/SoftSub/S03/720p.x265.10bit.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/SoftSub/S03/480p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/Dubbed/S01/720p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/Dubbed/S01/480p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/Dubbed/S02/720p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/Dubbed/S02/480p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls2.iran-onemovies-dcenter.com/DonyayeSerial/series4/tt10795658/Dubbed/S03/720p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+                              <svg fill="none" height="12" stroke="currentColor" stroke-linecap="round" stroke-width="2.5" viewBox="0 0 24 24" width="12"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                              دایرکتوری
+                            </a>
+
+curl -s https://azfilm.theazizi.ir/movie.php?imdb=tt10795658 | htmlq '.dl-quality-btn-dir' | grep 720 | grep -v x265 | grep -v Dubbed
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/SoftSub/S01/720p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/SoftSub/S02/720p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+<a class="dl-quality-btn dl-quality-btn-dir" href="https://dls8.iran-onemovies-dcenter.com/DonyayeSerial/series2/tt10795658/SoftSub/S03/720p.Web-DL/" rel="noopener" target="_blank" title="باز کردن دایرکتوری">
+
+
+curl -s https://dls5.iran-onemovies-dcenter.com/dl8/DonyayeSerial/series2/tt10795658/SoftSub/S01/720p.Web-DL/ | htmlq '.n code'
+<code><i class="far fa-file" style="padding-right: 5px;">Alice.in.Borderland.S01E01.720p.NF.Web-DL.x264.Pahe.SoftSub.DonyayeSerial.mkv</i></code>
+<code><i class="far fa-file" style="padding-right: 5px;">Alice.in.Borderland.S01E02.720p.NF.Web-DL.x264.Pahe.SoftSub.DonyayeSerial.mkv</i></code>
+<code><i class="far fa-file" style="padding-right: 5px;">Alice.in.Borderland.S01E03.720p.NF.Web-DL.x264.Pahe.SoftSub.DonyayeSerial.mkv</i></code>
+<code><i class="far fa-file" style="padding-right: 5px;">Alice.in.Borderland.S01E04.720p.NF.Web-DL.x264.Pahe.SoftSub.DonyayeSerial.mkv</i></code>
+<code><i class="far fa-file" style="padding-right: 5px;">Alice.in.Borderland.S01E05.720p.NF.Web-DL.x264.Pahe.SoftSub.DonyayeSerial.mkv</i></code>
+<code><i class="far fa-file" style="padding-right: 5px;">Alice.in.Borderland.S01E06.720p.NF.Web-DL.x264.Pahe.SoftSub.DonyayeSerial.mkv</i></code>
+<code><i class="far fa-file" style="padding-right: 5px;">Alice.in.Borderland.S01E07.720p.NF.Web-DL.x264.Pahe.SoftSub.DonyayeSerial.mkv</i></code>
+<code><i class="far fa-file" style="padding-right: 5px;">Alice.in.Borderland.S01E08.720p.NF.Web-DL.x264.Pahe.SoftSub.DonyayeSerial.mkv</i></code>

@@ -1,0 +1,25 @@
+# compiled binaries
+/sonrad
+/sonrad-*
+*.exe
+
+# release artefacts
+/dist/
+checksums.txt
+
+# local data
+/downloads/
+*.state.json
+
+# Go
+*.test
+*.out
+/vendor/
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+./resource/

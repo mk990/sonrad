@@ -1,0 +1,8 @@
+sonrad
+downloads/
+resource/
+*.md
+.git
+.gitignore
+.idea
+.vscode
