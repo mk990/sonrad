@@ -1,4 +1,4 @@
-// sonrad — Sonarr/Radarr bridge for azfilm.theazizi.ir
+// sonrad — Sonarr/Radarr bridge for film2mz.top
 //
 // Acts as BOTH a Newznab/Torznab indexer and a SABnzbd-compatible download
 // client. Single static Go file (stdlib only).
@@ -66,11 +66,11 @@ var (
 	flagRateLimit       = flag.Int64("rate-limit", 0, "aggregate bytes/sec cap (0 = unlimited)")
 	flagUA              = flag.String("user-agent", "Mozilla/5.0 (X11; Linux x86_64) sonrad/"+version, "HTTP User-Agent for upstream")
 	flagCookies         = flag.String("cookies", "", "raw Cookie header for upstream requests")
-	flagBase            = flag.String("base-url", "https://azfilm.theazizi.ir", "azfilm base URL")
+	flagBase            = flag.String("base-url", "https://www.film2mz.top", "main site base URL (env: SONRAD_BASE_URL)")
 	flagCacheTTL        = flag.Duration("cache-ttl", 10*time.Minute, "indexer scrape cache TTL")
 	flagPubHost         = flag.String("public-host", "", "host[:port] used in indexer callback links (default: from request Host header)")
 	flagDebug           = flag.Bool("debug", false, "verbose logging")
-	flagTestIMDB        = flag.String("test", "", "scrape this IMDB id, print results, exit")
+	flagTestIMDB        = flag.String("test", "", "search this title on the site, print results, exit")
 	flagStateFile       = flag.String("state-file", "", "path to JSON state file for queue/history persistence (default: <download-dir>/sonrad.state.json)")
 	flagInsecure        = flag.Bool("insecure-skip-verify", false, "skip TLS verification on upstream requests (for mirrors with bad certs)")
 	flagShutdownTimeout = flag.Duration("shutdown-timeout", 30*time.Second, "how long to wait for in-flight requests during shutdown")
@@ -415,12 +415,14 @@ func (c *cache) Set(k string, v any, ttl time.Duration) {
 }
 
 // ------------------------------------------------------------------
-// Scraper — pulls from azfilm.theazizi.ir
+// Scraper — pulls from film2mz.top
 // ------------------------------------------------------------------
 
+// Directory carries the release metadata parsed out of a download filename
+// (quality/codec/audio/source/season). film2mz serves flat per-file links
+// rather than browsable directories, so this is no longer a real directory —
+// it's kept as the unit the indexer formatters/category logic operate on.
 type Directory struct {
-	URL     string
-	Label   string // e.g. "SoftSub/S01/720p.Web-DL"
 	Quality string // 480p / 720p / 1080p / 2160p
 	Codec   string // x264 / x265
 	Audio   string // SoftSub / Dubbed
@@ -437,20 +439,15 @@ type FileEntry struct {
 }
 
 var (
-	reDirLink    = regexp.MustCompile(`(?is)class="[^"]*dl-quality-btn-dir[^"]*"\s+href="([^"]+)"`)
-	reTitle      = regexp.MustCompile(`(?is)<title>(.*?)</title>`)
-	reFile       = regexp.MustCompile(`(?is)<code><i[^>]*>([^<]+?\.(?:mkv|mp4|avi|m4v|mov|ts|wmv))</i></code>`)
-	reFileA      = regexp.MustCompile(`(?is)<a[^>]+href="([^"]+?\.(?:mkv|mp4|avi|m4v|mov|ts|wmv))"`)
-	reSizeCell   = regexp.MustCompile(`(?is)class="[^"]*\bs\b[^"]*"[^>]*>\s*<code[^>]*>([^<]+?)</code>`)
-	reSizeAny    = regexp.MustCompile(`(?i)^\s*([\d.]+)\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB|K|M|G|T)?\s*$`)
-	reSE         = regexp.MustCompile(`(?i)S(\d{1,2})E(\d{1,4})`)
-	reSeason     = regexp.MustCompile(`(?i)/S(\d{1,2})/`)
-	reIMDB       = regexp.MustCompile(`tt\d{6,9}`)
-	reSearchCard = regexp.MustCompile(`(?is)<a\s+class="card"\s+href="movie\.php\?imdb=(tt\d+)"[^>]*>(.*?)</a>`)
-	reCardType   = regexp.MustCompile(`(?is)class="ctype\s+(\w+)"`)
-	reCardTitle  = regexp.MustCompile(`(?is)<h2\s+class="ctitle">([^<]+)</h2>`)
+	reTitle = regexp.MustCompile(`(?is)<title>(.*?)</title>`)
+	// Absolute CDN download links on a post/series page. The play/online and
+	// player-launch anchors don't point at a media file, so this skips them.
+	reMediaURL = regexp.MustCompile(`(?i)href="(https?://[^"]+?\.(?:mkv|mp4|avi|m4v|mov|ts|wmv))"`)
+	reSE       = regexp.MustCompile(`(?i)S(\d{1,2})E(\d{1,4})`)
+	reIMDB     = regexp.MustCompile(`tt\d{6,9}`)
 	// Strip Sonarr/Radarr release-style noise from a free-text query before
-	// shipping it to azfilm. Order matters: episode tokens first, then years.
+	// shipping it to film2mz's search. Order matters: episode tokens first,
+	// then years.
 	reQueryEpisode = regexp.MustCompile(`(?i)\bs\d{1,2}(?:e\d{1,4})?\b`)
 	reQuerySeason  = regexp.MustCompile(`(?i)\bseason\s*\d{1,2}\b`)
 	reQueryYear    = regexp.MustCompile(`\b(19|20)\d{2}\b`)
@@ -478,62 +475,111 @@ func httpGetBytes(rawurl string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
 }
 
-func scrapeMoviePage(imdb string) (title string, dirs []Directory, err error) {
-	if !strings.HasPrefix(imdb, "tt") {
-		imdb = "tt" + imdb
-	}
-	key := "movie:" + imdb
-	if v, ok := scrapeC.Get(key); ok {
-		cached := v.(struct {
-			T string
-			D []Directory
-		})
-		return cached.T, cached.D, nil
-	}
-	body, err := httpGetBytes(*flagBase + "/movie.php?imdb=" + url.QueryEscape(imdb))
+// httpPostForm posts a urlencoded form, mirroring the headers film2mz's
+// /quick-search endpoint expects (X-Requested-With, Origin, Referer).
+func httpPostForm(rawurl string, form url.Values) ([]byte, error) {
+	req, err := http.NewRequest("POST", rawurl, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", nil, err
+		return nil, err
+	}
+	req.Header.Set("User-Agent", *flagUA)
+	if *flagCookies != "" {
+		req.Header.Set("Cookie", *flagCookies)
+	}
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	base := strings.TrimRight(*flagBase, "/")
+	req.Header.Set("Origin", base)
+	req.Header.Set("Referer", base+"/")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("POST %s: %s", rawurl, resp.Status)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+}
+
+// scrapePageFiles fetches a film2mz post/series page and returns every direct
+// download link on it. Quality/codec/audio/season are parsed per-file from the
+// filename; film2mz doesn't expose per-file sizes so Size stays 0 and callers
+// fall back to defaultSize().
+func scrapePageFiles(pageURL string) ([]FileEntry, error) {
+	key := "page:" + pageURL
+	if v, ok := scrapeC.Get(key); ok {
+		return v.([]FileEntry), nil
+	}
+	body, err := httpGetBytes(pageURL)
+	if err != nil {
+		return nil, err
 	}
 	s := string(body)
-	if m := reTitle.FindStringSubmatch(s); len(m) > 1 {
-		title = strings.TrimSpace(htmlUnescape(m[1]))
-		// strip site/brand suffix: "Title | Site", "Title - Site", "Title — Site", "Title – Site"
-		for _, sep := range []string{"|", " — ", " – ", " - "} {
-			if i := strings.LastIndex(title, sep); i > 0 && len(title)-i < 48 {
-				title = strings.TrimSpace(title[:i])
-			}
-		}
-	}
-	if title == "" {
-		title = imdb
-	}
+	var files []FileEntry
 	seen := map[string]bool{}
-	for _, m := range reDirLink.FindAllStringSubmatch(s, -1) {
+	for _, m := range reMediaURL.FindAllStringSubmatch(s, -1) {
 		u := htmlUnescape(m[1])
 		if seen[u] {
 			continue
 		}
 		seen[u] = true
-		dirs = append(dirs, parseDirURL(u))
+		files = append(files, fileEntryFromURL(u))
 	}
-	if len(dirs) > 0 { // never cache a no-result scrape — likely transient
-		scrapeC.Set(key, struct {
-			T string
-			D []Directory
-		}{title, dirs}, *flagCacheTTL)
+	if len(files) > 0 { // never cache a no-result scrape — likely transient
+		scrapeC.Set(key, files, *flagCacheTTL)
 	}
-	return title, dirs, nil
+	return files, nil
 }
 
-// SearchHit is one card from azfilm's /index.php?q= search results.
+func fileEntryFromURL(u string) FileEntry {
+	f := FileEntry{Name: fileNameFromURL(u), URL: u}
+	if m := reSE.FindStringSubmatch(f.Name); len(m) >= 3 {
+		f.Season, _ = strconv.Atoi(m[1])
+		f.Episode, _ = strconv.Atoi(m[2])
+	}
+	return f
+}
+
+// SearchHit is one result from film2mz's /quick-search endpoint.
 type SearchHit struct {
 	IMDB  string
 	Title string
 	IsTV  bool
+	URL   string // absolute page URL
+	Year  int
 }
 
-// searchByTitle queries azfilm's free-text search and returns one hit per card.
-func searchByTitle(q string) ([]SearchHit, error) {
+// film2Result is the subset of /quick-search's JSON we consume. The response is
+// a flat array; each element also carries a "_formatted" object with <em>-tagged
+// titles which we ignore in favour of the clean top-level fields.
+type film2Result struct {
+	IMDB  string  `json:"imdb_id"`
+	Title string  `json:"title"`
+	Type  string  `json:"type"` // "series" = TV, "post" = movie
+	URL   string  `json:"url"`
+	Year  flexInt `json:"year"`
+}
+
+// flexInt decodes a value that may arrive as a JSON number or a (possibly
+// empty) JSON string — film2mz sends "year" both ways. Unparseable values
+// decode to 0 rather than failing the whole response.
+type flexInt int
+
+func (n *flexInt) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(string(b), `"`)
+	if s == "" || s == "null" {
+		*n = 0
+		return nil
+	}
+	v, _ := strconv.Atoi(s)
+	*n = flexInt(v)
+	return nil
+}
+
+// searchFilm2 queries film2mz's free-text search and returns one hit per result.
+func searchFilm2(q string) ([]SearchHit, error) {
 	q = strings.TrimSpace(q)
 	if q == "" {
 		return nil, nil
@@ -542,28 +588,31 @@ func searchByTitle(q string) ([]SearchHit, error) {
 	if v, ok := scrapeC.Get(key); ok {
 		return v.([]SearchHit), nil
 	}
-	body, err := httpGetBytes(*flagBase + "/index.php?q=" + url.QueryEscape(q))
+	form := url.Values{}
+	form.Set("q", q)
+	form.Set("sort", "modified_at:desc")
+	body, err := httpPostForm(strings.TrimRight(*flagBase, "/")+"/quick-search", form)
 	if err != nil {
 		return nil, err
 	}
-	s := string(body)
+	var raw []film2Result
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("decode search: %w", err)
+	}
 	var hits []SearchHit
 	seen := map[string]bool{}
-	for _, m := range reSearchCard.FindAllStringSubmatch(s, -1) {
-		imdb := m[1]
-		if seen[imdb] {
+	for _, r := range raw {
+		if r.URL == "" || r.IMDB == "" || seen[r.URL] {
 			continue
 		}
-		seen[imdb] = true
-		h := SearchHit{IMDB: imdb}
-		block := m[2]
-		if mm := reCardTitle.FindStringSubmatch(block); len(mm) > 1 {
-			h.Title = htmlUnescape(strings.TrimSpace(mm[1]))
-		}
-		if mm := reCardType.FindStringSubmatch(block); len(mm) > 1 {
-			h.IsTV = strings.EqualFold(mm[1], "tv")
-		}
-		hits = append(hits, h)
+		seen[r.URL] = true
+		hits = append(hits, SearchHit{
+			IMDB:  r.IMDB,
+			Title: htmlUnescape(strings.TrimSpace(r.Title)),
+			IsTV:  strings.EqualFold(r.Type, "series"),
+			URL:   absURL(r.URL),
+			Year:  int(r.Year),
+		})
 	}
 	if len(hits) > 0 {
 		scrapeC.Set(key, hits, *flagCacheTTL)
@@ -571,10 +620,18 @@ func searchByTitle(q string) ([]SearchHit, error) {
 	return hits, nil
 }
 
-// cleanQuery strips Sonarr/Radarr release-style noise so azfilm's
+func absURL(u string) string {
+	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		return u
+	}
+	return strings.TrimRight(*flagBase, "/") + "/" + strings.TrimLeft(u, "/")
+}
+
+// cleanQuery strips Sonarr/Radarr release-style noise so film2mz's
 // natural-language search can match. e.g.
-//   "Alice.in.Borderland.S01E05" → "Alice in Borderland"
-//   "The.Matrix.1999"            → "The Matrix"
+//
+//	"Alice.in.Borderland.S01E05" → "Alice in Borderland"
+//	"The.Matrix.1999"            → "The Matrix"
 func cleanQuery(q string) string {
 	q = strings.ReplaceAll(q, ".", " ")
 	q = strings.ReplaceAll(q, "_", " ")
@@ -585,45 +642,41 @@ func cleanQuery(q string) string {
 	return strings.TrimSpace(q)
 }
 
-func parseDirURL(rawurl string) Directory {
-	d := Directory{URL: rawurl}
-	label := strings.TrimSuffix(rawurl, "/")
-	if i := strings.Index(label, "/tt"); i >= 0 {
-		rest := label[i+1:]
-		parts := strings.Split(rest, "/")
-		if len(parts) > 1 {
-			d.Label = strings.Join(parts[1:], "/")
-		}
+// parseRelease extracts quality/codec/audio/source (+ season for episodes)
+// from a release filename, e.g.
+//
+//	"V.for.Vendetta.2005.1080p.BluRay.x265.Farsi.Sub.mkv"
+//	"Alice.in.Borderland.S02E01.1080p.WEB-DL.Farsi.Dubbed.mkv"
+func parseRelease(name string) Directory {
+	var d Directory
+	if m := reSE.FindStringSubmatch(name); len(m) >= 2 {
+		d.Season, _ = strconv.Atoi(m[1])
 	}
-	L := d.Label
-	if m := reSeason.FindStringSubmatch("/" + L + "/"); len(m) > 1 {
-		n, _ := strconv.Atoi(m[1])
-		d.Season = n
-	}
+	low := strings.ToLower(name)
 	switch {
-	case strings.Contains(L, "2160p"), strings.Contains(L, "4K"):
+	case strings.Contains(name, "2160p"), strings.Contains(low, "4k"):
 		d.Quality = "2160p"
-	case strings.Contains(L, "1080p"):
+	case strings.Contains(name, "1080p"):
 		d.Quality = "1080p"
-	case strings.Contains(L, "720p"):
+	case strings.Contains(name, "720p"):
 		d.Quality = "720p"
-	case strings.Contains(L, "480p"):
+	case strings.Contains(name, "480p"):
 		d.Quality = "480p"
 	}
-	if strings.Contains(L, "x265") || strings.Contains(strings.ToLower(L), "hevc") {
+	if strings.Contains(name, "x265") || strings.Contains(low, "hevc") || strings.Contains(low, "10bit") {
 		d.Codec = "x265"
 	} else {
 		d.Codec = "x264"
 	}
 	switch {
-	case strings.Contains(strings.ToLower(L), "bluray"):
+	case strings.Contains(low, "bluray"):
 		d.Source = "BluRay"
-	case strings.Contains(strings.ToLower(L), "webrip"):
+	case strings.Contains(low, "webrip"):
 		d.Source = "WEBRip"
 	default:
 		d.Source = "Web-DL"
 	}
-	if strings.Contains(L, "Dubbed") {
+	if strings.Contains(low, "dubbed") {
 		d.Audio = "Dubbed"
 	} else {
 		d.Audio = "SoftSub"
@@ -631,120 +684,20 @@ func parseDirURL(rawurl string) Directory {
 	return d
 }
 
-func scrapeDirectory(dirURL string) ([]FileEntry, error) {
-	key := "dir:" + dirURL
-	if v, ok := scrapeC.Get(key); ok {
-		return v.([]FileEntry), nil
+// fileNameFromURL returns the decoded basename of a download URL, dropping any
+// query string or fragment.
+func fileNameFromURL(u string) string {
+	name := u
+	if i := strings.IndexAny(name, "?#"); i >= 0 {
+		name = name[:i]
 	}
-	body, err := httpGetBytes(dirURL)
-	if err != nil {
-		return nil, err
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
 	}
-	s := string(body)
-	var files []FileEntry
-	seen := map[string]bool{}
-
-	// 1. Anchor tags (preferred — gives us the actual URL)
-	for _, m := range reFileA.FindAllStringSubmatch(s, -1) {
-		name := htmlUnescape(m[1])
-		// strip directory components if any
-		if i := strings.LastIndex(name, "/"); i >= 0 {
-			name = name[i+1:]
-		}
-		if seen[name] || name == "" {
-			continue
-		}
-		seen[name] = true
-		files = append(files, fileEntryFromName(dirURL, name))
+	if dec, err := url.PathUnescape(name); err == nil && dec != "" {
+		name = dec
 	}
-	// 2. <code><i>filename</i></code> fallback
-	for _, m := range reFile.FindAllStringSubmatch(s, -1) {
-		name := strings.TrimSpace(htmlUnescape(m[1]))
-		if seen[name] || name == "" {
-			continue
-		}
-		seen[name] = true
-		files = append(files, fileEntryFromName(dirURL, name))
-	}
-
-	// Sizes live in cells like <td class="s"><code>1.2 G</code></td> —
-	// gather them in document order and pair each filename with the next
-	// size cell that appears after it.
-	type posVal struct {
-		pos int
-		val string
-	}
-	var sizes []posVal
-	for _, m := range reSizeCell.FindAllStringSubmatchIndex(s, -1) {
-		sizes = append(sizes, posVal{pos: m[0], val: strings.TrimSpace(s[m[2]:m[3]])})
-	}
-	for i := range files {
-		filePos := strings.Index(s, files[i].Name)
-		if filePos < 0 {
-			continue
-		}
-		for _, sz := range sizes {
-			if sz.pos > filePos {
-				files[i].Size = parseSizeFlexible(sz.val)
-				break
-			}
-		}
-	}
-
-	if len(files) > 0 {
-		scrapeC.Set(key, files, *flagCacheTTL)
-	}
-	return files, nil
-}
-
-func fileEntryFromName(dirURL, name string) FileEntry {
-	f := FileEntry{Name: name, URL: joinURL(dirURL, name)}
-	if m := reSE.FindStringSubmatch(name); len(m) >= 3 {
-		f.Season, _ = strconv.Atoi(m[1])
-		f.Episode, _ = strconv.Atoi(m[2])
-	}
-	return f
-}
-
-func joinURL(base, name string) string {
-	if !strings.HasSuffix(base, "/") {
-		base += "/"
-	}
-	return base + url.PathEscape(name)
-}
-
-// parseSizeFlexible accepts "1.2 GB", "1.2GB", "1.2G", "523823104", "-", "" etc.
-// Single-letter suffixes K/M/G/T are treated as KB/MB/GB/TB (binary units).
-func parseSizeFlexible(s string) int64 {
-	s = strings.TrimSpace(s)
-	if s == "" || s == "-" {
-		return 0
-	}
-	m := reSizeAny.FindStringSubmatch(s)
-	if len(m) < 2 {
-		return 0
-	}
-	f, err := strconv.ParseFloat(m[1], 64)
-	if err != nil {
-		return 0
-	}
-	unit := ""
-	if len(m) > 2 {
-		unit = strings.ToUpper(m[2])
-	}
-	switch unit {
-	case "", "B":
-		return int64(f)
-	case "K", "KB", "KIB":
-		return int64(f * 1024)
-	case "M", "MB", "MIB":
-		return int64(f * 1024 * 1024)
-	case "G", "GB", "GIB":
-		return int64(f * 1024 * 1024 * 1024)
-	case "T", "TB", "TIB":
-		return int64(f * 1024 * 1024 * 1024 * 1024)
-	}
-	return 0
+	return name
 }
 
 func htmlUnescape(s string) string {
@@ -766,8 +719,7 @@ func htmlUnescape(s string) string {
 type Token struct {
 	Title    string   `json:"t"`
 	Category string   `json:"c"`
-	DirURL   string   `json:"d"`
-	Files    []string `json:"f,omitempty"` // empty = download whole dir
+	URLs     []string `json:"u"` // absolute CDN file URL(s) to download
 }
 
 func encodeToken(t Token) string {
@@ -837,14 +789,14 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 func capsXML() string {
 	return `<?xml version="1.0" encoding="UTF-8"?>
 <caps>
-  <server version="` + version + `" title="sonrad" strapline="azfilm.theazizi.ir bridge" email="" url="" image=""/>
+  <server version="` + version + `" title="sonrad" strapline="film2mz.top bridge" email="" url="" image=""/>
   <limits max="100" default="100"/>
   <retention days="9999"/>
   <registration available="no" open="no"/>
   <searching>
     <search available="yes" supportedParams="q"/>
-    <tv-search available="yes" supportedParams="q,imdbid,season,ep"/>
-    <movie-search available="yes" supportedParams="q,imdbid"/>
+    <tv-search available="yes" supportedParams="q,season,ep"/>
+    <movie-search available="yes" supportedParams="q"/>
     <audio-search available="no"/>
     <book-search available="no"/>
   </searching>
@@ -877,9 +829,9 @@ type indexerItem struct {
 	Episode  int
 }
 
-// maxTitleSearchCandidates caps how many movie pages we scrape per free-text
-// search. Each candidate triggers one movie-page fetch plus N directory-listing
-// fetches, so this protects azfilm from a thundering herd.
+// maxTitleSearchCandidates caps how many result pages we scrape per free-text
+// search. Each candidate triggers one page fetch, so this protects film2mz from
+// a thundering herd when a query is ambiguous.
 const maxTitleSearchCandidates = 5
 
 func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
@@ -892,7 +844,8 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 	wantSeason, _ := strconv.Atoi(q.Get("season"))
 	wantEp, _ := strconv.Atoi(q.Get("ep"))
 
-	// Resolve which IMDB ids to emit results for.
+	// film2mz has no imdb→page endpoint, so we resolve candidate pages via its
+	// free-text search and (when supplied) keep only those whose imdb matches.
 	imdb := q.Get("imdbid")
 	if imdb == "" {
 		if m := reIMDB.FindString(q.Get("q")); m != "" {
@@ -903,35 +856,38 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 		imdb = "tt" + imdb
 	}
 
-	var candidateIMDBs []string
-	if imdb != "" {
-		candidateIMDBs = []string{imdb}
-	} else if qstr := strings.TrimSpace(q.Get("q")); qstr != "" {
-		hits, err := searchByTitle(cleanQuery(qstr))
-		if err != nil {
-			if *flagDebug {
-				log.Printf("title search %q: %v", qstr, err)
-			}
-		}
-		for _, h := range hits {
-			switch mode {
-			case "movie":
-				if h.IsTV {
-					continue
-				}
-			case "tvsearch":
-				if !h.IsTV {
-					continue
-				}
-			}
-			candidateIMDBs = append(candidateIMDBs, h.IMDB)
-			if len(candidateIMDBs) >= maxTitleSearchCandidates {
-				break
-			}
+	qstr := strings.TrimSpace(q.Get("q"))
+	var hits []SearchHit
+	if qstr != "" {
+		var err error
+		hits, err = searchFilm2(cleanQuery(qstr))
+		if err != nil && *flagDebug {
+			log.Printf("search %q: %v", qstr, err)
 		}
 	}
 
-	if len(candidateIMDBs) == 0 {
+	var candidates []SearchHit
+	for _, h := range hits {
+		switch mode {
+		case "movie":
+			if h.IsTV {
+				continue
+			}
+		case "tvsearch":
+			if !h.IsTV {
+				continue
+			}
+		}
+		if imdb != "" && !strings.EqualFold(h.IMDB, imdb) {
+			continue
+		}
+		candidates = append(candidates, h)
+		if len(candidates) >= maxTitleSearchCandidates {
+			break
+		}
+	}
+
+	if len(candidates) == 0 {
 		// Sonarr/Radarr's indexer Test sends an empty query; an empty feed trips
 		// the "no results in configured categories" warning that blocks Save in
 		// some versions. Emit a single placeholder in the right top-level
@@ -942,7 +898,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 			cat = 2000
 		}
 		placeholder := indexerItem{
-			Title:    "sonrad bridge ready — searches require IMDB id",
+			Title:    "sonrad bridge ready — searches require a title query",
 			GUID:     "sonrad-placeholder",
 			Link:     pub + "/getnzb?token=placeholder&apikey=" + url.QueryEscape(apikey),
 			PubDate:  time.Unix(0, 0),
@@ -953,33 +909,33 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 		return
 	}
 
-	// Fan out one scrape per candidate IMDB. With up to 5 candidates and ~16
-	// directories each that's 80+ HTTPs; serial would take many seconds.
+	// Fan out one page scrape per candidate; these are the expensive HTTP calls
+	// and are independent of each other.
 	type result struct {
 		title string
 		items []indexerItem
 	}
-	results := make([]result, len(candidateIMDBs))
+	results := make([]result, len(candidates))
 	sem := make(chan struct{}, max(1, *flagSearchConc))
 	var wg sync.WaitGroup
-	for i, im := range candidateIMDBs {
+	for i, h := range candidates {
 		wg.Add(1)
-		go func(i int, im string) {
+		go func(i int, h SearchHit) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			title, dirs, err := scrapeMoviePage(im)
+			files, err := scrapePageFiles(h.URL)
 			if err != nil {
 				if *flagDebug {
-					log.Printf("scrape %s: %v", im, err)
+					log.Printf("scrape %s: %v", h.URL, err)
 				}
 				return
 			}
 			results[i] = result{
-				title: title,
-				items: emitItemsForMovie(title, im, dirs, mode, wantSeason, wantEp, apikey, pub),
+				title: h.Title,
+				items: emitItemsForHit(h, files, wantSeason, wantEp, apikey, pub),
 			}
-		}(i, im)
+		}(i, h)
 	}
 	wg.Wait()
 
@@ -994,100 +950,43 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 	respondXML(w, renderFeed(feedTitle, items))
 }
 
-// emitItemsForMovie expands the directory list scraped from one IMDB page
-// into per-episode (+ season-pack) or per-movie indexer items.
-func emitItemsForMovie(title, imdb string, dirs []Directory, mode string, wantSeason, wantEp int, apikey, pub string) []indexerItem {
-	siteHasTV := false
-	for _, d := range dirs {
-		if d.Season > 0 {
-			siteHasTV = true
-			break
-		}
-	}
-
-	// Determine which directories survive the mode/season filter so we only
-	// pay for listings we'll actually use.
-	type relevantDir struct {
-		idx int
-		dir Directory
-	}
-	var relevant []relevantDir
-	for i, d := range dirs {
-		dirIsTV := d.Season > 0
-		switch mode {
-		case "movie":
-			if dirIsTV {
-				continue
-			}
-		case "tvsearch":
-			if !dirIsTV {
-				continue
-			}
-		}
-		if wantSeason > 0 && d.Season != wantSeason {
-			continue
-		}
-		if *flagNoDubbed && d.Audio == "Dubbed" {
-			continue
-		}
-		relevant = append(relevant, relevantDir{i, d})
-	}
-
-	// Fetch all surviving directory listings in parallel — these are the
-	// expensive HTTP calls and are independent of each other.
-	listings := make([][]FileEntry, len(relevant))
-	{
-		sem := make(chan struct{}, max(1, *flagSearchConc))
-		var wg sync.WaitGroup
-		for i, rd := range relevant {
-			wg.Add(1)
-			go func(i int, d Directory) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				files, err := scrapeDirectory(d.URL)
-				if err != nil {
-					if *flagDebug {
-						log.Printf("scrape dir %s: %v", d.URL, err)
-					}
-					return
-				}
-				listings[i] = files
-			}(i, rd.dir)
-		}
-		wg.Wait()
-	}
-
+// emitItemsForHit turns the download links scraped from one film2mz page into
+// per-episode (+ season-pack) or per-movie indexer items.
+func emitItemsForHit(h SearchHit, files []FileEntry, wantSeason, wantEp int, apikey, pub string) []indexerItem {
+	title := h.Title
+	imdb := h.IMDB
 	var items []indexerItem
-	for i, rd := range relevant {
-		d := rd.dir
-		dirIsTV := d.Season > 0
-		files := listings[i]
-		if files == nil {
-			continue
-		}
 
-		if dirIsTV {
-			// per-episode results
-			for _, f := range files {
-				if f.Episode == 0 {
-					continue
-				}
-				if wantEp > 0 && f.Episode != wantEp {
-					continue
-				}
-				if f.Season == 0 {
-					f.Season = d.Season
-				}
-				tk := Token{
-					Title:    formatTVName(title, f, d),
-					Category: "tv",
-					DirURL:   d.URL,
-					Files:    []string{f.Name},
-				}
+	if h.IsTV {
+		// Group episodes by (season, quality, codec, audio, source) so we can
+		// also offer season packs alongside the per-episode releases.
+		type packKey struct {
+			season                        int
+			quality, codec, audio, source string
+		}
+		packs := map[packKey][]FileEntry{}
+		var order []packKey
+
+		for _, f := range files {
+			if f.Episode == 0 {
+				continue
+			}
+			d := parseRelease(f.Name)
+			if f.Season == 0 {
+				f.Season = d.Season
+			}
+			d.Season = f.Season
+			if *flagNoDubbed && d.Audio == "Dubbed" {
+				continue
+			}
+			if wantSeason > 0 && f.Season != wantSeason {
+				continue
+			}
+			if wantEp == 0 || f.Episode == wantEp {
+				tk := Token{Title: formatTVName(title, h.Year, f, d), Category: "tv", URLs: []string{f.URL}}
 				items = append(items, indexerItem{
 					Title:    tk.Title,
-					GUID:     "sonrad-" + hashStr(d.URL+":"+f.Name),
+					GUID:     "sonrad-" + hashStr(f.URL),
 					Link:     pub + "/getnzb?token=" + encodeToken(tk) + "&apikey=" + url.QueryEscape(apikey),
 					PubDate:  time.Now().Add(-time.Hour),
 					Size:     fileSize(f, d),
@@ -1097,71 +996,60 @@ func emitItemsForMovie(title, imdb string, dirs []Directory, mode string, wantSe
 					Episode:  f.Episode,
 				})
 			}
-			// season-pack result (whole dir)
-			if wantEp == 0 && len(files) > 0 {
-				tk := Token{
-					Title:    formatSeasonPackName(title, d),
-					Category: "tv",
-					DirURL:   d.URL,
+			k := packKey{f.Season, d.Quality, d.Codec, d.Audio, d.Source}
+			if _, ok := packs[k]; !ok {
+				order = append(order, k)
+			}
+			packs[k] = append(packs[k], f)
+		}
+
+		// Season packs — only meaningful when the query isn't pinned to one ep.
+		if wantEp == 0 {
+			for _, k := range order {
+				grp := packs[k]
+				if len(grp) < 2 {
+					continue
 				}
+				d := Directory{Season: k.season, Quality: k.quality, Codec: k.codec, Audio: k.audio, Source: k.source}
+				var urls []string
 				var packSize int64
-				for _, f := range files {
-					if f.Size > 0 {
-						packSize += f.Size
-					} else {
-						packSize += defaultSize(d, false)
-					}
+				for _, f := range grp {
+					urls = append(urls, f.URL)
+					packSize += fileSize(f, d)
 				}
+				tk := Token{Title: formatSeasonPackName(title, h.Year, d), Category: "tv", URLs: urls}
 				items = append(items, indexerItem{
 					Title:    tk.Title,
-					GUID:     "sonrad-" + hashStr(d.URL+":PACK"),
+					GUID:     "sonrad-" + hashStr(fmt.Sprintf("%s:S%dpack:%s.%s.%s.%s", h.URL, k.season, k.quality, k.codec, k.audio, k.source)),
 					Link:     pub + "/getnzb?token=" + encodeToken(tk) + "&apikey=" + url.QueryEscape(apikey),
 					PubDate:  time.Now().Add(-time.Hour),
 					Size:     packSize,
 					Category: categoryFor("tv", d),
 					IMDB:     imdb,
-					Season:   d.Season,
-				})
-			}
-		} else {
-			// Movie. Some hosts also serve series under non-season dirs — skip
-			// those when site has clear TV structure.
-			if siteHasTV && mode == "" {
-				continue
-			}
-			if len(files) == 0 {
-				tk := Token{Title: formatMovieName(title, d), Category: "movies", DirURL: d.URL}
-				items = append(items, indexerItem{
-					Title:    tk.Title,
-					GUID:     "sonrad-" + hashStr(d.URL),
-					Link:     pub + "/getnzb?token=" + encodeToken(tk) + "&apikey=" + url.QueryEscape(apikey),
-					PubDate:  time.Now().Add(-time.Hour),
-					Size:     defaultSize(d, true),
-					Category: categoryFor("movies", d),
-					IMDB:     imdb,
-				})
-				continue
-			}
-			for _, f := range files {
-				tk := Token{
-					Title:    formatMovieName(title, d),
-					Category: "movies",
-					DirURL:   d.URL,
-					Files:    []string{f.Name},
-				}
-				items = append(items, indexerItem{
-					Title:    tk.Title,
-					GUID:     "sonrad-" + hashStr(d.URL+":"+f.Name),
-					Link:     pub + "/getnzb?token=" + encodeToken(tk) + "&apikey=" + url.QueryEscape(apikey),
-					PubDate:  time.Now().Add(-time.Hour),
-					Size:     fileSize(f, d),
-					Category: categoryFor("movies", d),
-					IMDB:     imdb,
+					Season:   k.season,
 				})
 			}
 		}
+		return items
 	}
 
+	// Movie — one item per download link.
+	for _, f := range files {
+		d := parseRelease(f.Name)
+		if *flagNoDubbed && d.Audio == "Dubbed" {
+			continue
+		}
+		tk := Token{Title: formatMovieName(title, h.Year, d), Category: "movies", URLs: []string{f.URL}}
+		items = append(items, indexerItem{
+			Title:    tk.Title,
+			GUID:     "sonrad-" + hashStr(f.URL),
+			Link:     pub + "/getnzb?token=" + encodeToken(tk) + "&apikey=" + url.QueryEscape(apikey),
+			PubDate:  time.Now().Add(-time.Hour),
+			Size:     fileSize(f, d),
+			Category: categoryFor("movies", d),
+			IMDB:     imdb,
+		})
+	}
 	return items
 }
 
@@ -1218,8 +1106,11 @@ func fileSize(f FileEntry, d Directory) int64 {
 	return defaultSize(d, false)
 }
 
-func formatMovieName(title string, d Directory) string {
+func formatMovieName(title string, year int, d Directory) string {
 	parts := []string{stripTitle(title)}
+	if year > 0 {
+		parts = append(parts, strconv.Itoa(year))
+	}
 	if d.Quality != "" {
 		parts = append(parts, d.Quality)
 	}
@@ -1232,12 +1123,16 @@ func formatMovieName(title string, d Directory) string {
 	if d.Audio == "Dubbed" {
 		parts = append(parts, "DUBBED")
 	}
-	parts = append(parts, "AZFILM")
+	parts = append(parts, "FILM2MZ")
 	return strings.Join(parts, ".")
 }
 
-func formatSeasonPackName(title string, d Directory) string {
-	parts := []string{stripTitle(title), fmt.Sprintf("S%02d", d.Season)}
+func formatSeasonPackName(title string, year int, d Directory) string {
+	parts := []string{stripTitle(title)}
+	if year > 0 {
+		parts = append(parts, strconv.Itoa(year))
+	}
+	parts = append(parts, fmt.Sprintf("S%02d", d.Season))
 	if d.Quality != "" {
 		parts = append(parts, d.Quality)
 	}
@@ -1250,12 +1145,16 @@ func formatSeasonPackName(title string, d Directory) string {
 	if d.Audio == "Dubbed" {
 		parts = append(parts, "DUBBED")
 	}
-	parts = append(parts, "AZFILM")
+	parts = append(parts, "FILM2MZ")
 	return strings.Join(parts, ".")
 }
 
-func formatTVName(title string, f FileEntry, d Directory) string {
-	parts := []string{stripTitle(title), fmt.Sprintf("S%02dE%02d", f.Season, f.Episode)}
+func formatTVName(title string, year int, f FileEntry, d Directory) string {
+	parts := []string{stripTitle(title)}
+	if year > 0 {
+		parts = append(parts, strconv.Itoa(year))
+	}
+	parts = append(parts, fmt.Sprintf("S%02dE%02d", f.Season, f.Episode))
 	if d.Quality != "" {
 		parts = append(parts, d.Quality)
 	}
@@ -1268,7 +1167,7 @@ func formatTVName(title string, f FileEntry, d Directory) string {
 	if d.Audio == "Dubbed" {
 		parts = append(parts, "DUBBED")
 	}
-	parts = append(parts, "AZFILM")
+	parts = append(parts, "FILM2MZ")
 	return strings.Join(parts, ".")
 }
 
@@ -1291,7 +1190,7 @@ func renderFeed(title string, items []indexerItem) string {
 	b.WriteString(`<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/" xmlns:atom="http://www.w3.org/2005/Atom">` + "\n")
 	b.WriteString(`<channel>` + "\n")
 	b.WriteString(`<title>` + xmlEsc(title) + `</title>` + "\n")
-	b.WriteString(`<description>sonrad bridge for azfilm.theazizi.ir</description>` + "\n")
+	b.WriteString(`<description>sonrad bridge for film2mz.top</description>` + "\n")
 	b.WriteString(`<link>` + xmlEsc(*flagBase) + `</link>` + "\n")
 	b.WriteString(`<language>en-US</language>` + "\n")
 	b.WriteString(`<newznab:response offset="0" total="` + strconv.Itoa(len(items)) + `"/>` + "\n")
@@ -1377,7 +1276,7 @@ func extractToken(b []byte) (Token, error) {
 	if m := reNZBToken.FindSubmatch(b); len(m) > 1 {
 		return decodeToken(strings.TrimSpace(string(m[1])))
 	}
-	if t, err := decodeToken(string(bytes.TrimSpace(b))); err == nil && t.DirURL != "" {
+	if t, err := decodeToken(string(bytes.TrimSpace(b))); err == nil && len(t.URLs) > 0 {
 		return t, nil
 	}
 	return Token{}, errors.New("no sonrad token found")
@@ -1453,8 +1352,8 @@ func sabGetConfig(w http.ResponseWriter, r *http.Request) {
 				{"name": "movies", "dir": "movies", "pp": 3, "script": "None", "priority": 0},
 				{"name": "tv", "dir": "tv", "pp": 3, "script": "None", "priority": 0},
 			},
-			"sorters":  []any{},
-			"servers":  []any{},
+			"sorters":    []any{},
+			"servers":    []any{},
 			"scheduling": []any{},
 		},
 	})
@@ -1715,8 +1614,8 @@ func chooseCat(r *http.Request) string {
 // ------------------------------------------------------------------
 
 func startJob(t Token) (*Job, error) {
-	if t.DirURL == "" {
-		return nil, errors.New("token has no dir_url")
+	if len(t.URLs) == 0 {
+		return nil, errors.New("token has no urls")
 	}
 	cat := t.Category
 	if cat == "" {
@@ -1738,32 +1637,12 @@ func startJob(t Token) (*Job, error) {
 		Added:       time.Now(),
 		StoragePath: storage,
 	}
-	if len(t.Files) > 0 {
-		for _, fn := range t.Files {
-			f := &JobFile{
-				URL:      joinURL(t.DirURL, fn),
-				Filename: fn,
-				Status:   "pending",
-			}
-			j.Files = append(j.Files, f)
-		}
-	} else {
-		entries, err := scrapeDirectory(t.DirURL)
-		if err != nil {
-			return nil, err
-		}
-		if len(entries) == 0 {
-			return nil, fmt.Errorf("no files in %s", t.DirURL)
-		}
-		for _, e := range entries {
-			j.Files = append(j.Files, &JobFile{
-				URL:      e.URL,
-				Filename: e.Name,
-				Bytes:    e.Size,
-				Status:   "pending",
-			})
-			j.Bytes += e.Size
-		}
+	for _, u := range t.URLs {
+		j.Files = append(j.Files, &JobFile{
+			URL:      u,
+			Filename: fileNameFromURL(u),
+			Status:   "pending",
+		})
 	}
 	log.Printf("queued %s (%s) → %s [%d file(s)]", j.Name, cat, storage, len(j.Files))
 	mgr.Add(j)
@@ -2078,10 +1957,10 @@ func htmlEscMin(s string) string {
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	queue, history := mgr.Snapshot()
 	writeJSON(w, 200, map[string]any{
-		"status":          "ok",
-		"version":         version,
-		"queue_length":    len(queue),
-		"history_length":  len(history),
+		"status":         "ok",
+		"version":        version,
+		"queue_length":   len(queue),
+		"history_length": len(history),
 	})
 }
 
@@ -2199,24 +2078,30 @@ func main() {
 	log.Printf("bye")
 }
 
-func testScrape(imdb string) {
-	title, dirs, err := scrapeMoviePage(imdb)
+// testScrape runs a free-text search against film2mz and, for each hit, scrapes
+// its page and prints the download links + parsed release metadata.
+func testScrape(query string) {
+	hits, err := searchFilm2(cleanQuery(query))
 	if err != nil {
-		log.Fatalf("scrape: %v", err)
+		log.Fatalf("search: %v", err)
 	}
-	fmt.Printf("Title: %s\n", title)
-	fmt.Printf("Directories: %d\n\n", len(dirs))
-	for _, d := range dirs {
-		fmt.Printf("  %s\n", d.URL)
-		fmt.Printf("    season=%d quality=%s codec=%s source=%s audio=%s\n",
-			d.Season, d.Quality, d.Codec, d.Source, d.Audio)
-		files, err := scrapeDirectory(d.URL)
+	fmt.Printf("Query: %q → %d hit(s)\n\n", query, len(hits))
+	for _, h := range hits {
+		kind := "movie"
+		if h.IsTV {
+			kind = "tv"
+		}
+		fmt.Printf("%s [%s] (%s, %d)\n  %s\n", h.Title, kind, h.IMDB, h.Year, h.URL)
+		files, err := scrapePageFiles(h.URL)
 		if err != nil {
 			fmt.Printf("    error: %v\n", err)
 			continue
 		}
 		for _, f := range files {
-			fmt.Printf("    - %s (S%02dE%02d, %s)\n", f.Name, f.Season, f.Episode, bytesString(f.Size))
+			d := parseRelease(f.Name)
+			fmt.Printf("    - %s (S%02dE%02d, q=%s codec=%s src=%s audio=%s)\n",
+				f.Name, f.Season, f.Episode, d.Quality, d.Codec, d.Source, d.Audio)
+			fmt.Printf("        %s\n", f.URL)
 		}
 		fmt.Println()
 	}
