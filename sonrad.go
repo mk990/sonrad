@@ -752,6 +752,15 @@ func authOK(r *http.Request) bool {
 	if k == "" {
 		k = r.Header.Get("X-Api-Key")
 	}
+	if k == "" {
+		// Some SABnzbd clients send the key in the (multipart) form body rather
+		// than the URL, notably on addfile POSTs. Parse as a fallback; harmless
+		// for query-only GET requests.
+		k = r.FormValue("apikey")
+		if k == "" {
+			k = r.FormValue("api_key")
+		}
+	}
 	return k == *flagAPIKey
 }
 
