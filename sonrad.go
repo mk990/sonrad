@@ -967,6 +967,27 @@ func emitItemsForHit(h SearchHit, files []FileEntry, wantSeason, wantEp int, api
 		packs := map[packKey][]FileEntry{}
 		var order []packKey
 
+		// Pre-pass: note which (season, episode) pairs ship with a real
+		// resolution. film2mz sometimes serves a bare ".mkv" with no quality
+		// token alongside the 1080p/720p files; emitted as-is those parse as
+		// "Unknown" quality and Sonarr ignores them. Drop the bare variant when
+		// a proper one exists, keeping it only when it's the sole copy.
+		type seKey struct{ season, episode int }
+		hasQuality := map[seKey]bool{}
+		for _, f := range files {
+			if f.Episode == 0 {
+				continue
+			}
+			d := parseRelease(f.Name)
+			season := f.Season
+			if season == 0 {
+				season = d.Season
+			}
+			if d.Quality != "" {
+				hasQuality[seKey{season, f.Episode}] = true
+			}
+		}
+
 		for _, f := range files {
 			if f.Episode == 0 {
 				continue
@@ -980,6 +1001,9 @@ func emitItemsForHit(h SearchHit, files []FileEntry, wantSeason, wantEp int, api
 				continue
 			}
 			if wantSeason > 0 && f.Season != wantSeason {
+				continue
+			}
+			if d.Quality == "" && hasQuality[seKey{f.Season, f.Episode}] {
 				continue
 			}
 			if wantEp == 0 || f.Episode == wantEp {
