@@ -857,11 +857,12 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 	}
 
 	qstr := strings.TrimSpace(q.Get("q"))
+	log.Printf("search: t=%s q=%q season=%q ep=%q imdb=%q", mode, qstr, q.Get("season"), q.Get("ep"), imdb)
 	var hits []SearchHit
 	if qstr != "" {
 		var err error
 		hits, err = searchFilm2(cleanQuery(qstr))
-		if err != nil && *flagDebug {
+		if err != nil {
 			log.Printf("search %q: %v", qstr, err)
 		}
 	}
@@ -947,6 +948,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 		}
 		items = append(items, r.items...)
 	}
+	log.Printf("search: t=%s q=%q → %d candidate(s), %d item(s)", mode, qstr, len(candidates), len(items))
 	respondXML(w, renderFeed(feedTitle, items))
 }
 
