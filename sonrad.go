@@ -348,7 +348,7 @@ func (m *Manager) loadState() {
 
 func (m *Manager) runJob(j *Job) {
 	j.mu.Lock()
-	j.Status = "Downloading"
+	j.Status = "Queued"
 	storage := j.StoragePath
 	files := append([]*JobFile(nil), j.Files...)
 	j.mu.Unlock()
@@ -367,6 +367,9 @@ func (m *Manager) runJob(j *Job) {
 			return
 		case m.sem <- struct{}{}:
 		}
+		j.mu.Lock()
+		j.Status = "Downloading"
+		j.mu.Unlock()
 		f.Status = "downloading"
 		dest := filepath.Join(storage, sanitizeFilename(f.Filename))
 		err := downloadFileWithRetry(m.ctx, f.URL, dest, m.rateLimit, *flagRetries, func(n int64) {
