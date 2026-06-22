@@ -876,7 +876,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 		}
 	}
 
-	var candidates []SearchHit
+	var candidates, imdbMatched []SearchHit
 	for _, h := range hits {
 		switch mode {
 		case "movie":
@@ -888,13 +888,21 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 				continue
 			}
 		}
-		if imdb != "" && !strings.EqualFold(h.IMDB, imdb) {
-			continue
-		}
 		candidates = append(candidates, h)
-		if len(candidates) >= maxTitleSearchCandidates {
-			break
+		if imdb != "" && strings.EqualFold(h.IMDB, imdb) {
+			imdbMatched = append(imdbMatched, h)
 		}
+	}
+	// Prefer the imdb-exact hit, but only when there is one. film2mz's imdb data
+	// is frequently wrong or missing (especially for anime), so an imdb that
+	// doesn't line up must not zero out an otherwise-good title match.
+	if len(imdbMatched) > 0 {
+		candidates = imdbMatched
+	} else if imdb != "" {
+		log.Printf("search: imdb=%q matched no hit; falling back to title matches", imdb)
+	}
+	if len(candidates) > maxTitleSearchCandidates {
+		candidates = candidates[:maxTitleSearchCandidates]
 	}
 
 	if len(candidates) == 0 {
@@ -941,10 +949,11 @@ func handleSearch(w http.ResponseWriter, r *http.Request, mode string) {
 				}
 				return
 			}
-			results[i] = result{
-				title: h.Title,
-				items: emitItemsForHit(h, files, wantSeason, wantEp, apikey, pub),
+			its := emitItemsForHit(h, files, wantSeason, wantEp, apikey, pub)
+			if len(its) == 0 {
+				log.Printf("search: %q (%s): scraped %d file(s) but 0 matched season=%d ep=%d — likely an episode-numbering mismatch", h.Title, h.URL, len(files), wantSeason, wantEp)
 			}
+			results[i] = result{title: h.Title, items: its}
 		}(i, h)
 	}
 	wg.Wait()
