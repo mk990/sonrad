@@ -108,6 +108,9 @@ type Job struct {
 	speedBPS        float64
 	lastSampleAt    time.Time
 	lastSampleBytes int64
+	cancel          context.CancelFunc // cancels this job's download goroutine
+	jctx            context.Context    // per-job context (child of the manager ctx)
+	deleted         bool               // set by Delete so finalize won't resurrect it into history
 }
 
 // recordProgress is called whenever `n` more bytes have been pulled for `f`.
@@ -194,6 +197,11 @@ func (m *Manager) markDirty() {
 }
 
 func (m *Manager) Add(j *Job) {
+	j.mu.Lock()
+	if j.jctx == nil {
+		j.jctx, j.cancel = context.WithCancel(m.ctx)
+	}
+	j.mu.Unlock()
 	m.mu.Lock()
 	m.queue = append(m.queue, j)
 	m.mu.Unlock()
@@ -205,24 +213,51 @@ func (m *Manager) Add(j *Job) {
 	}()
 }
 
-func (m *Manager) Delete(id string) bool {
+// Delete removes a job from the queue or history. It also cancels any in-flight
+// download and marks the job deleted so the runJob goroutine can't resurrect it
+// into history after we've removed it. When delFiles is true, the job's storage
+// folder is removed too. Returns the removed job (for file cleanup) and whether
+// anything was found.
+func (m *Manager) Delete(id string, delFiles bool) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var target *Job
 	for i, j := range m.queue {
 		if j.ID == id {
+			target = j
 			m.queue = append(m.queue[:i], m.queue[i+1:]...)
-			m.markDirty()
-			return true
+			break
 		}
 	}
-	for i, j := range m.history {
-		if j.ID == id {
-			m.history = append(m.history[:i], m.history[i+1:]...)
-			m.markDirty()
-			return true
+	if target == nil {
+		for i, j := range m.history {
+			if j.ID == id {
+				target = j
+				m.history = append(m.history[:i], m.history[i+1:]...)
+				break
+			}
 		}
 	}
-	return false
+	if target == nil {
+		m.mu.Unlock()
+		return false
+	}
+	target.mu.Lock()
+	target.deleted = true
+	cancel := target.cancel
+	storage := target.StoragePath
+	target.mu.Unlock()
+	m.markDirty()
+	m.mu.Unlock()
+
+	if cancel != nil {
+		cancel() // stop the in-flight download so it can't re-add itself
+	}
+	if delFiles && storage != "" {
+		if err := os.RemoveAll(storage); err != nil {
+			log.Printf("delete %s: remove %s: %v", id, storage, err)
+		}
+	}
+	return true
 }
 
 func (m *Manager) Snapshot() (queue, history []*Job) {
@@ -243,6 +278,13 @@ func (m *Manager) finalize(j *Job, ok bool, errMsg string) {
 		}
 	}
 	j.mu.Lock()
+	if j.deleted {
+		// Deleted mid-flight — don't resurrect it into history (that's what made
+		// removed downloads reappear in Sonarr on the next history poll).
+		j.mu.Unlock()
+		m.markDirty()
+		return
+	}
 	j.Completed = time.Now()
 	if ok {
 		j.Status = "Completed"
@@ -351,7 +393,11 @@ func (m *Manager) runJob(j *Job) {
 	j.Status = "Queued"
 	storage := j.StoragePath
 	files := append([]*JobFile(nil), j.Files...)
+	jctx := j.jctx
 	j.mu.Unlock()
+	if jctx == nil {
+		jctx = m.ctx
+	}
 
 	if err := os.MkdirAll(storage, 0o755); err != nil {
 		m.finalize(j, false, "mkdir: "+err.Error())
@@ -362,8 +408,8 @@ func (m *Manager) runJob(j *Job) {
 	failMsg := ""
 	for _, f := range files {
 		select {
-		case <-m.ctx.Done():
-			m.finalize(j, false, "shutting down")
+		case <-jctx.Done():
+			m.finalize(j, false, "canceled")
 			return
 		case m.sem <- struct{}{}:
 		}
@@ -372,7 +418,7 @@ func (m *Manager) runJob(j *Job) {
 		j.mu.Unlock()
 		f.Status = "downloading"
 		dest := filepath.Join(storage, sanitizeFilename(f.Filename))
-		err := downloadFileWithRetry(m.ctx, f.URL, dest, m.rateLimit, *flagRetries, func(n int64) {
+		err := downloadFileWithRetry(jctx, f.URL, dest, m.rateLimit, *flagRetries, func(n int64) {
 			j.recordProgress(f, n)
 		}, func(total int64) {
 			j.setFileSize(f, total)
@@ -1666,10 +1712,11 @@ func sabAddFile(w http.ResponseWriter, r *http.Request) {
 
 func sabDelete(w http.ResponseWriter, r *http.Request) {
 	val := firstNonEmpty(r.URL.Query().Get("value"), r.FormValue("value"))
+	delFiles := firstNonEmpty(r.URL.Query().Get("del_files"), r.FormValue("del_files")) == "1"
 	for _, id := range strings.Split(val, ",") {
 		id = strings.TrimSpace(id)
 		if id != "" {
-			mgr.Delete(id)
+			mgr.Delete(id, delFiles)
 		}
 	}
 	writeJSON(w, 200, map[string]any{"status": true})
