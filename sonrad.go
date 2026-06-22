@@ -719,6 +719,18 @@ func fileNameFromURL(u string) string {
 	return name
 }
 
+// releaseFileName builds the on-disk filename for a downloaded file: the
+// Sonarr/Radarr-parseable release name (e.g. Show.S02E01.720p.…FILM2MZ) plus
+// the real extension carried by the upstream URL. This is what lets Sonarr map
+// each file in a season-pack folder back to its episode.
+func releaseFileName(release, u string) string {
+	ext := filepath.Ext(fileNameFromURL(u))
+	if ext == "" || len(ext) > 5 {
+		ext = ".mkv"
+	}
+	return release + ext
+}
+
 func htmlUnescape(s string) string {
 	r := strings.NewReplacer(
 		"&amp;", "&",
@@ -740,6 +752,7 @@ type Token struct {
 	Category string   `json:"c"`
 	URLs     []string `json:"u"` // absolute CDN file URL(s) to download
 	Sizes    []int64  `json:"s,omitempty"` // per-URL size estimate (bytes); seeds the queue's total so progress isn't 0/NaN before the first byte
+	Names    []string `json:"n,omitempty"` // per-URL on-disk filename (Sonarr/Radarr-parseable release name + real ext); without this a season pack's files keep their raw CDN names and Sonarr can't map them to episodes
 }
 
 func encodeToken(t Token) string {
@@ -1047,7 +1060,7 @@ func emitItemsForHit(h SearchHit, files []FileEntry, wantSeason, wantEp int, api
 				continue
 			}
 			if wantEp == 0 || f.Episode == wantEp {
-				tk := Token{Title: formatTVName(title, h.Year, f, d), Category: "tv", URLs: []string{f.URL}, Sizes: []int64{fileSize(f, d)}}
+				tk := Token{Title: formatTVName(title, h.Year, f, d), Category: "tv", URLs: []string{f.URL}, Sizes: []int64{fileSize(f, d)}, Names: []string{releaseFileName(formatTVName(title, h.Year, f, d), f.URL)}}
 				items = append(items, indexerItem{
 					Title:    tk.Title,
 					GUID:     "sonrad-" + hashStr(f.URL),
@@ -1077,14 +1090,16 @@ func emitItemsForHit(h SearchHit, files []FileEntry, wantSeason, wantEp int, api
 				d := Directory{Season: k.season, Quality: k.quality, Codec: k.codec, Audio: k.audio, Source: k.source}
 				var urls []string
 				var sizes []int64
+				var names []string
 				var packSize int64
 				for _, f := range grp {
 					sz := fileSize(f, d)
 					urls = append(urls, f.URL)
 					sizes = append(sizes, sz)
+					names = append(names, releaseFileName(formatTVName(title, h.Year, f, d), f.URL))
 					packSize += sz
 				}
-				tk := Token{Title: formatSeasonPackName(title, h.Year, d), Category: "tv", URLs: urls, Sizes: sizes}
+				tk := Token{Title: formatSeasonPackName(title, h.Year, d), Category: "tv", URLs: urls, Sizes: sizes, Names: names}
 				items = append(items, indexerItem{
 					Title:    tk.Title,
 					GUID:     "sonrad-" + hashStr(fmt.Sprintf("%s:S%dpack:%s.%s.%s.%s", h.URL, k.season, k.quality, k.codec, k.audio, k.source)),
@@ -1106,7 +1121,7 @@ func emitItemsForHit(h SearchHit, files []FileEntry, wantSeason, wantEp int, api
 		if *flagNoDubbed && d.Audio == "Dubbed" {
 			continue
 		}
-		tk := Token{Title: formatMovieName(title, h.Year, d), Category: "movies", URLs: []string{f.URL}, Sizes: []int64{fileSize(f, d)}}
+		tk := Token{Title: formatMovieName(title, h.Year, d), Category: "movies", URLs: []string{f.URL}, Sizes: []int64{fileSize(f, d)}, Names: []string{releaseFileName(formatMovieName(title, h.Year, d), f.URL)}}
 		items = append(items, indexerItem{
 			Title:    tk.Title,
 			GUID:     "sonrad-" + hashStr(f.URL),
@@ -1709,9 +1724,13 @@ func startJob(t Token) (*Job, error) {
 		if i < len(t.Sizes) {
 			sz = t.Sizes[i]
 		}
+		name := fileNameFromURL(u)
+		if i < len(t.Names) && t.Names[i] != "" {
+			name = t.Names[i]
+		}
 		j.Files = append(j.Files, &JobFile{
 			URL:      u,
-			Filename: fileNameFromURL(u),
+			Filename: name,
 			Bytes:    sz,
 			Status:   "pending",
 		})
