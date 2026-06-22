@@ -138,6 +138,20 @@ func (j *Job) recordProgress(f *JobFile, n int64) {
 	j.lastSampleBytes = j.BytesDone
 }
 
+// setFileSize records the authoritative byte size for `f` (learned from the
+// CDN's Content-Length) and keeps the job total in sync, replacing whatever
+// estimate the indexer seeded. Without a non-zero total the SAB queue reports
+// size 0 and Sonarr renders progress as "NaN%".
+func (j *Job) setFileSize(f *JobFile, total int64) {
+	if f == nil || total <= 0 {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.Bytes += total - f.Bytes
+	f.Bytes = total
+}
+
 type JobFile struct {
 	URL       string
 	Filename  string
@@ -357,6 +371,8 @@ func (m *Manager) runJob(j *Job) {
 		dest := filepath.Join(storage, sanitizeFilename(f.Filename))
 		err := downloadFileWithRetry(m.ctx, f.URL, dest, m.rateLimit, *flagRetries, func(n int64) {
 			j.recordProgress(f, n)
+		}, func(total int64) {
+			j.setFileSize(f, total)
 		})
 		<-m.sem
 		if err != nil {
@@ -720,6 +736,7 @@ type Token struct {
 	Title    string   `json:"t"`
 	Category string   `json:"c"`
 	URLs     []string `json:"u"` // absolute CDN file URL(s) to download
+	Sizes    []int64  `json:"s,omitempty"` // per-URL size estimate (bytes); seeds the queue's total so progress isn't 0/NaN before the first byte
 }
 
 func encodeToken(t Token) string {
@@ -1027,7 +1044,7 @@ func emitItemsForHit(h SearchHit, files []FileEntry, wantSeason, wantEp int, api
 				continue
 			}
 			if wantEp == 0 || f.Episode == wantEp {
-				tk := Token{Title: formatTVName(title, h.Year, f, d), Category: "tv", URLs: []string{f.URL}}
+				tk := Token{Title: formatTVName(title, h.Year, f, d), Category: "tv", URLs: []string{f.URL}, Sizes: []int64{fileSize(f, d)}}
 				items = append(items, indexerItem{
 					Title:    tk.Title,
 					GUID:     "sonrad-" + hashStr(f.URL),
@@ -1056,12 +1073,15 @@ func emitItemsForHit(h SearchHit, files []FileEntry, wantSeason, wantEp int, api
 				}
 				d := Directory{Season: k.season, Quality: k.quality, Codec: k.codec, Audio: k.audio, Source: k.source}
 				var urls []string
+				var sizes []int64
 				var packSize int64
 				for _, f := range grp {
+					sz := fileSize(f, d)
 					urls = append(urls, f.URL)
-					packSize += fileSize(f, d)
+					sizes = append(sizes, sz)
+					packSize += sz
 				}
-				tk := Token{Title: formatSeasonPackName(title, h.Year, d), Category: "tv", URLs: urls}
+				tk := Token{Title: formatSeasonPackName(title, h.Year, d), Category: "tv", URLs: urls, Sizes: sizes}
 				items = append(items, indexerItem{
 					Title:    tk.Title,
 					GUID:     "sonrad-" + hashStr(fmt.Sprintf("%s:S%dpack:%s.%s.%s.%s", h.URL, k.season, k.quality, k.codec, k.audio, k.source)),
@@ -1083,7 +1103,7 @@ func emitItemsForHit(h SearchHit, files []FileEntry, wantSeason, wantEp int, api
 		if *flagNoDubbed && d.Audio == "Dubbed" {
 			continue
 		}
-		tk := Token{Title: formatMovieName(title, h.Year, d), Category: "movies", URLs: []string{f.URL}}
+		tk := Token{Title: formatMovieName(title, h.Year, d), Category: "movies", URLs: []string{f.URL}, Sizes: []int64{fileSize(f, d)}}
 		items = append(items, indexerItem{
 			Title:    tk.Title,
 			GUID:     "sonrad-" + hashStr(f.URL),
@@ -1681,12 +1701,18 @@ func startJob(t Token) (*Job, error) {
 		Added:       time.Now(),
 		StoragePath: storage,
 	}
-	for _, u := range t.URLs {
+	for i, u := range t.URLs {
+		var sz int64
+		if i < len(t.Sizes) {
+			sz = t.Sizes[i]
+		}
 		j.Files = append(j.Files, &JobFile{
 			URL:      u,
 			Filename: fileNameFromURL(u),
+			Bytes:    sz,
 			Status:   "pending",
 		})
+		j.Bytes += sz
 	}
 	log.Printf("queued %s (%s) → %s [%d file(s)]", j.Name, cat, storage, len(j.Files))
 	mgr.Add(j)
@@ -1716,7 +1742,7 @@ func permanentDownloadError(err error) bool {
 // downloadFileWithRetry calls downloadFile up to `attempts` times with
 // exponential backoff. Resume via HTTP Range means each retry continues from
 // the bytes already on disk, so retries are cheap.
-func downloadFileWithRetry(ctx context.Context, urlStr, dest string, rateLimit int64, attempts int, onProgress func(int64)) error {
+func downloadFileWithRetry(ctx context.Context, urlStr, dest string, rateLimit int64, attempts int, onProgress func(int64), onSize func(int64)) error {
 	if attempts < 1 {
 		attempts = 1
 	}
@@ -1726,7 +1752,7 @@ func downloadFileWithRetry(ctx context.Context, urlStr, dest string, rateLimit i
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		err := downloadFile(ctx, urlStr, dest, rateLimit, onProgress)
+		err := downloadFile(ctx, urlStr, dest, rateLimit, onProgress, onSize)
 		if err == nil {
 			return nil
 		}
@@ -1748,7 +1774,7 @@ func downloadFileWithRetry(ctx context.Context, urlStr, dest string, rateLimit i
 	return lastErr
 }
 
-func downloadFile(ctx context.Context, urlStr, dest string, rateLimit int64, onProgress func(int64)) error {
+func downloadFile(ctx context.Context, urlStr, dest string, rateLimit int64, onProgress func(int64), onSize func(int64)) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
@@ -1776,7 +1802,10 @@ func downloadFile(ctx context.Context, urlStr, dest string, rateLimit int64, onP
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-		// presumably already complete
+		// presumably already complete — the bytes already on disk are the size
+		if onSize != nil && startAt > 0 {
+			onSize(startAt)
+		}
 		if onProgress != nil && startAt > 0 {
 			onProgress(0)
 		}
@@ -1784,6 +1813,16 @@ func downloadFile(ctx context.Context, urlStr, dest string, rateLimit int64, onP
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("HTTP %s", resp.Status)
+	}
+	// Report the file's true total size as soon as the CDN reveals it. For a
+	// 206 the Content-Length covers only the remaining range, so add the bytes
+	// we resumed from; a 200 carries the whole file.
+	if onSize != nil && resp.ContentLength > 0 {
+		if resp.StatusCode == http.StatusPartialContent {
+			onSize(startAt + resp.ContentLength)
+		} else {
+			onSize(resp.ContentLength)
+		}
 	}
 	flag := os.O_CREATE | os.O_WRONLY
 	if startAt > 0 && resp.StatusCode == http.StatusPartialContent {
@@ -1887,7 +1926,11 @@ func percentage(done, total int64) string {
 	if total <= 0 {
 		return "0"
 	}
-	return strconv.Itoa(int(done * 100 / total))
+	p := int(done * 100 / total)
+	if p > 100 {
+		p = 100
+	}
+	return strconv.Itoa(p)
 }
 
 var reUnsafe = regexp.MustCompile(`[\\/:*?"<>|]+`)
