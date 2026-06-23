@@ -404,47 +404,70 @@ func (m *Manager) runJob(j *Job) {
 		return
 	}
 
-	failedAny := false
-	failMsg := ""
+	// Download the job's files concurrently, but gate every file on the shared
+	// m.sem so we never exceed -max-concurrent transfers in total — across all
+	// jobs *and* within this one (e.g. a season pack). The slot is acquired here
+	// before launching so the loop blocks once the pool is full, then released
+	// by the worker goroutine when its file finishes.
+	var (
+		fileWG    sync.WaitGroup
+		failMu    sync.Mutex
+		failedAny bool
+		failMsg   string
+		canceled  bool
+	)
 	for _, f := range files {
 		select {
 		case <-jctx.Done():
-			m.finalize(j, false, "canceled")
-			return
+			canceled = true
 		case m.sem <- struct{}{}:
+		}
+		if canceled {
+			break
 		}
 		j.mu.Lock()
 		j.Status = "Downloading"
 		j.mu.Unlock()
 		f.Status = "downloading"
-		dest := filepath.Join(storage, sanitizeFilename(f.Filename))
-		err := downloadFileWithRetry(jctx, f.URL, dest, m.rateLimit, *flagRetries, func(n int64) {
-			j.recordProgress(f, n)
-		}, func(total int64) {
-			j.setFileSize(f, total)
-		})
-		<-m.sem
-		if err != nil {
-			f.Status = "failed"
-			f.Error = err.Error()
-			failedAny = true
-			failMsg = err.Error()
-			log.Printf("job %s: file %q failed: %v", j.ID, f.Filename, err)
-			continue
-		}
-		f.Status = "done"
-		// Reconcile size if upstream didn't advertise it
-		if info, e := os.Stat(dest); e == nil {
-			j.mu.Lock()
-			diff := info.Size() - f.Bytes
-			f.Bytes = info.Size()
-			if f.BytesDone != info.Size() {
-				j.BytesDone += info.Size() - f.BytesDone
-				f.BytesDone = info.Size()
+		fileWG.Add(1)
+		go func(f *JobFile) {
+			defer fileWG.Done()
+			defer func() { <-m.sem }()
+			dest := filepath.Join(storage, sanitizeFilename(f.Filename))
+			err := downloadFileWithRetry(jctx, f.URL, dest, m.rateLimit, *flagRetries, func(n int64) {
+				j.recordProgress(f, n)
+			}, func(total int64) {
+				j.setFileSize(f, total)
+			})
+			if err != nil {
+				f.Status = "failed"
+				f.Error = err.Error()
+				failMu.Lock()
+				failedAny = true
+				failMsg = err.Error()
+				failMu.Unlock()
+				log.Printf("job %s: file %q failed: %v", j.ID, f.Filename, err)
+				return
 			}
-			j.Bytes += diff
-			j.mu.Unlock()
-		}
+			f.Status = "done"
+			// Reconcile size if upstream didn't advertise it
+			if info, e := os.Stat(dest); e == nil {
+				j.mu.Lock()
+				diff := info.Size() - f.Bytes
+				f.Bytes = info.Size()
+				if f.BytesDone != info.Size() {
+					j.BytesDone += info.Size() - f.BytesDone
+					f.BytesDone = info.Size()
+				}
+				j.Bytes += diff
+				j.mu.Unlock()
+			}
+		}(f)
+	}
+	fileWG.Wait()
+	if canceled {
+		m.finalize(j, false, "canceled")
+		return
 	}
 	m.finalize(j, !failedAny, failMsg)
 }
