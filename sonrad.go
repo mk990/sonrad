@@ -509,7 +509,13 @@ var (
 	// player-launch anchors don't point at a media file, so this skips them.
 	reMediaURL = regexp.MustCompile(`(?i)href="(https?://[^"]+?\.(?:mkv|mp4|avi|m4v|mov|ts|wmv))"`)
 	reSE       = regexp.MustCompile(`(?i)S(\d{1,2})E(\d{1,4})`)
-	reIMDB     = regexp.MustCompile(`tt\d{6,9}`)
+	// Anime/series often name files with a bare episode token and no season
+	// prefix, e.g. "Solo.Leveling.E1.1080p…mkv" or "…EP01…". Used only when
+	// reSE doesn't match; the season is recovered from the URL path instead.
+	reEpOnly = regexp.MustCompile(`(?i)(?:^|[._ -])E(?:P|pisode)?[._ -]?(\d{1,4})(?:[._ -]|$)`)
+	// Season folder in a CDN path, e.g. ".../Series/Solo.Leveling/S01/file.mkv".
+	reSeasonPath = regexp.MustCompile(`(?i)/S(\d{1,2})/`)
+	reIMDB       = regexp.MustCompile(`tt\d{6,9}`)
 	// Strip Sonarr/Radarr release-style noise from a free-text query before
 	// shipping it to film2mz's search. Order matters: episode tokens first,
 	// then years.
@@ -603,6 +609,19 @@ func fileEntryFromURL(u string) FileEntry {
 	if m := reSE.FindStringSubmatch(f.Name); len(m) >= 3 {
 		f.Season, _ = strconv.Atoi(m[1])
 		f.Episode, _ = strconv.Atoi(m[2])
+		return f
+	}
+	// No SxxExx token: recover a bare episode token ("E1", "EP01") from the
+	// filename and the season from the URL path (".../S01/..."), defaulting to
+	// season 1 when the path carries no season folder.
+	if m := reEpOnly.FindStringSubmatch(f.Name); len(m) >= 2 {
+		f.Episode, _ = strconv.Atoi(m[1])
+		if m := reSeasonPath.FindStringSubmatch(u); len(m) >= 2 {
+			f.Season, _ = strconv.Atoi(m[1])
+		}
+		if f.Season == 0 {
+			f.Season = 1
+		}
 	}
 	return f
 }
