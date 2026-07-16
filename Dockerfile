@@ -3,9 +3,11 @@ FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
-COPY sonrad.go .
+COPY go.mod ./
+COPY cmd ./cmd
+COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w" -o /out/sonrad sonrad.go
+    go build -trimpath -ldflags="-s -w" -o /out/sonrad ./cmd/sonrad
 
 # --- runtime stage ---
 FROM alpine:3.20

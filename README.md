@@ -1,6 +1,6 @@
 # sonrad
 
-A single-file Go bridge that lets **Sonarr** and **Radarr** download from
+A Go bridge that lets **Sonarr** and **Radarr** download from
 `film2mz.top` direct links.
 
 It speaks two protocols at once:
@@ -12,7 +12,17 @@ It speaks two protocols at once:
   downloads the file(s) into the right folder, and reports
   status back so the import works automatically.
 
-No external dependencies (Go stdlib only). One file.
+No external dependencies (Go stdlib only).
+
+```
+cmd/sonrad/         entry point: flags, wiring, lifecycle
+internal/config/    shared runtime configuration
+internal/upstream/  HTTP client for the site + CDN (UA/cookies/TLS)
+internal/film2/     film2mz scraper: search + page-link extraction
+internal/release/   release-name parsing, formatting, categories, sizes
+internal/download/  job queue, downloader (resume/retry/throttle), state
+internal/server/    Newznab indexer, SABnzbd API, NZB token, status page
+```
 
 ---
 
@@ -21,7 +31,7 @@ No external dependencies (Go stdlib only). One file.
 ### From source
 
 ```sh
-go build -o sonrad sonrad.go
+go build -o sonrad ./cmd/sonrad
 
 ./sonrad \
   -addr :8910 \

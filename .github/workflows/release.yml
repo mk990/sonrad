@@ -95,7 +95,7 @@ jobs:
           else
             binary="sonrad"
           fi
-          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o "$binary" sonrad.go
+          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" -o "$binary" ./cmd/sonrad
 
           if [ "$GOOS" = "windows" ]; then
             zip -j "dist/${name}.zip" "$binary" README.md
