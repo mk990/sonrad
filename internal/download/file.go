@@ -119,8 +119,8 @@ func (m *Manager) downloadFile(ctx context.Context, urlStr, dest string, onProgr
 	defer f.Close()
 
 	var reader io.Reader = resp.Body
-	if m.opts.RateLimit > 0 {
-		reader = newThrottledReader(resp.Body, m.opts.RateLimit)
+	if m.throttle != nil {
+		reader = m.throttle.reader(resp.Body)
 	}
 	buf := make([]byte, 256*1024)
 	for {

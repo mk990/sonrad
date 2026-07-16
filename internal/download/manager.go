@@ -32,10 +32,11 @@ type Manager struct {
 	queue   []*Job
 	history []*Job
 
-	up   *upstream.Client
-	opts Options
-	sem  chan struct{}
-	ctx  context.Context
+	up       *upstream.Client
+	opts     Options
+	sem      chan struct{} // caps concurrent file transfers across all jobs
+	throttle *throttle     // shared aggregate rate limiter (nil = unlimited)
+	ctx      context.Context
 
 	dirty  atomic.Bool
 	saveMu sync.Mutex     // serializes state-file writes
@@ -49,12 +50,16 @@ func NewManager(ctx context.Context, up *upstream.Client, opts Options) *Manager
 	if opts.Retries < 1 {
 		opts.Retries = 1
 	}
-	return &Manager{
+	m := &Manager{
 		up:   up,
 		opts: opts,
 		sem:  make(chan struct{}, opts.MaxConcurrent),
 		ctx:  ctx,
 	}
+	if opts.RateLimit > 0 {
+		m.throttle = newThrottle(opts.RateLimit)
+	}
+	return m
 }
 
 // Add queues a job and starts its download goroutine.
@@ -176,10 +181,9 @@ func (m *Manager) runJob(j *Job) {
 		jctx = m.ctx
 	}
 
-	if err := os.MkdirAll(storage, 0o755); err != nil {
-		m.finalize(j, false, "mkdir: "+err.Error())
-		return
-	}
+	// The storage directory is created by downloadFile when a file actually
+	// starts, not here — a job waiting for a download slot must not touch the
+	// disk yet, or every queued job looks like it started downloading at once.
 
 	// Download the job's files concurrently, but gate every file on the shared
 	// m.sem so we never exceed MaxConcurrent transfers in total — across all
