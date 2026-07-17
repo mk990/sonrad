@@ -47,7 +47,7 @@ func (s *Server) capsXML() string {
   <searching>
     <search available="yes" supportedParams="q"/>
     <tv-search available="yes" supportedParams="q,season,ep"/>
-    <movie-search available="yes" supportedParams="q"/>
+    <movie-search available="yes" supportedParams="q,year"/>
     <audio-search available="no"/>
     <book-search available="no"/>
   </searching>
@@ -91,13 +91,22 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, mode strin
 	}
 
 	qstr := strings.TrimSpace(q.Get("q"))
-	slog.Info("search", "t", mode, "q", qstr, "season", q.Get("season"), "ep", q.Get("ep"), "imdb", imdb)
+	wantYear, _ := strconv.Atoi(q.Get("year"))
+	variants, wantAbs := buildSearchQueries(mode, qstr, wantSeason, wantEp, wantYear)
+	slog.Info("search", "t", mode, "q", qstr, "season", q.Get("season"), "ep", q.Get("ep"), "year", wantYear, "abs", wantAbs, "imdb", imdb)
 	var hits []film2.SearchHit
-	if qstr != "" {
-		var err error
-		hits, err = s.site.Search(release.CleanQuery(qstr))
+	seenURL := map[string]bool{}
+	for _, v := range variants {
+		vhits, err := s.site.Search(v)
 		if err != nil {
-			slog.Warn("search failed", "q", qstr, "err", err)
+			slog.Warn("search failed", "q", v, "err", err)
+			continue
+		}
+		for _, h := range vhits {
+			if !seenURL[h.URL] {
+				seenURL[h.URL] = true
+				hits = append(hits, h)
+			}
 		}
 	}
 
@@ -106,6 +115,12 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, mode strin
 		switch mode {
 		case "movie":
 			if h.IsTV {
+				continue
+			}
+			// A requested year rules out clearly different movies (±1 for
+			// release-date fuzz). Hits with year 0 stay in — the site often
+			// leaves the field empty and keeps the year in the title instead.
+			if wantYear > 0 && h.Year > 0 && (h.Year < wantYear-1 || h.Year > wantYear+1) {
 				continue
 			}
 		case "tvsearch":
@@ -155,10 +170,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, mode strin
 				slog.Debug("scrape failed", "url", h.URL, "err", err)
 				return
 			}
-			its := s.itemsForHit(h, files, wantSeason, wantEp, apikey, pub)
+			its := s.itemsForHit(h, files, wantSeason, wantEp, wantAbs, apikey, pub)
 			if len(its) == 0 {
 				slog.Info("search: scraped files but none matched — likely an episode-numbering mismatch",
-					"title", h.Title, "url", h.URL, "files", len(files), "season", wantSeason, "ep", wantEp)
+					"title", h.Title, "url", h.URL, "files", len(files), "season", wantSeason, "ep", wantEp, "abs", wantAbs)
 			}
 			results[i] = result{title: h.Title, items: its}
 		}(i, h)
@@ -197,13 +212,105 @@ func (s *Server) respondPlaceholderFeed(w http.ResponseWriter, mode, apikey, pub
 	respondXML(w, s.renderFeed("sonrad", []indexerItem{placeholder}))
 }
 
+// buildSearchQueries decides what to actually send to film2mz's search for an
+// incoming query, most specific variant first (results are merged in order,
+// deduped by URL). It also detects anime-style absolute-episode queries.
+func buildSearchQueries(mode, qstr string, wantSeason, wantEp, wantYear int) (variants []string, wantAbs int) {
+	if qstr == "" {
+		return nil, 0
+	}
+	searchQ := qstr
+	// Sonarr searches anime as "<title> <absolute-ep>" with no season/ep
+	// params. The number would poison the site search, so split it off and
+	// match on it later instead.
+	if mode != "movie" && wantSeason == 0 && wantEp == 0 {
+		if base, abs, ok := release.SplitAbsoluteEpisode(qstr); ok {
+			searchQ, wantAbs = base, abs
+		}
+	}
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		for _, v := range variants {
+			if strings.EqualFold(v, s) {
+				return
+			}
+		}
+		variants = append(variants, s)
+	}
+	cleaned := release.CleanQuery(searchQ)
+	// film2mz ranks on the full string and returns only ~10 results, so a
+	// year (from the ?year= param or embedded in the query) is a strong
+	// ranking signal we must not strip — "Michael" alone never surfaces
+	// "Michael 2026". The year-kept variant is only added when there is a
+	// year, so routine episode searches still cost a single site call.
+	if wantYear > 0 {
+		add(cleaned + " " + strconv.Itoa(wantYear))
+	}
+	if release.HasYear(searchQ) {
+		add(release.Normalize(searchQ))
+	}
+	add(cleaned)
+	return variants, wantAbs
+}
+
 // itemsForHit turns the download links scraped from one film2mz page into
 // per-episode (+ season-pack) or per-movie indexer items.
-func (s *Server) itemsForHit(h film2.SearchHit, files []film2.FileEntry, wantSeason, wantEp int, apikey, pub string) []indexerItem {
+func (s *Server) itemsForHit(h film2.SearchHit, files []film2.FileEntry, wantSeason, wantEp, wantAbs int, apikey, pub string) []indexerItem {
 	if h.IsTV {
+		if wantAbs > 0 {
+			return s.tvAbsoluteItems(h, files, wantAbs, apikey, pub)
+		}
 		return s.tvItems(h, files, wantSeason, wantEp, apikey, pub)
 	}
 	return s.movieItems(h, files, apikey, pub)
+}
+
+// tvAbsoluteItems serves anime-style searches: the site stores long-running
+// anime as "S01" with absolute episode numbers (One Piece is S01E0001…E1100+),
+// which never lines up with TVDB seasons — so match on the episode number
+// alone and emit absolute-numbered release names Sonarr's anime parser reads.
+func (s *Server) tvAbsoluteItems(h film2.SearchHit, files []film2.FileEntry, wantAbs int, apikey, pub string) []indexerItem {
+	hasQuality := false
+	for _, f := range files {
+		if f.Episode == wantAbs && release.Parse(f.Name).Quality != "" {
+			hasQuality = true
+			break
+		}
+	}
+	var items []indexerItem
+	for _, f := range files {
+		if f.Episode != wantAbs {
+			continue
+		}
+		inf := release.Parse(f.Name)
+		if s.cfg.NoDubbed && inf.Audio == "Dubbed" {
+			continue
+		}
+		if inf.Quality == "" && hasQuality {
+			continue
+		}
+		name := release.AnimeName(h.Title, wantAbs, inf)
+		size := release.SizeOrDefault(f.Size, inf)
+		tk := Token{
+			Title:    name,
+			Category: "tv",
+			URLs:     []string{f.URL},
+			Sizes:    []int64{size},
+			Names:    []string{naming.ReleaseFileName(name, f.URL)},
+		}
+		items = append(items, indexerItem{
+			Title:    name,
+			GUID:     "sonrad-" + hashStr(f.URL) + "-abs",
+			Link:     itemLink(pub, apikey, tk),
+			PubDate:  time.Now().Add(-time.Hour),
+			Size:     size,
+			Category: release.Category("tv", inf),
+			IMDB:     h.IMDB,
+		})
+	}
+	return items
 }
 
 // itemLink builds the /getnzb callback link carrying the encoded token.

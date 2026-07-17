@@ -55,6 +55,42 @@ func TestNames(t *testing.T) {
 	}
 }
 
+func TestSplitAbsoluteEpisode(t *testing.T) {
+	cases := []struct {
+		in    string
+		title string
+		abs   int
+		ok    bool
+	}{
+		{"one piece 1090", "one piece", 1090, true},
+		{"One.Piece.1090", "One Piece", 1090, true},
+		{"naruto 09", "naruto", 9, true},
+		{"doctor who 2005", "", 0, false}, // trailing year = part of the title
+		{"michael 2026", "", 0, false},
+		{"one piece", "", 0, false},
+		{"1917", "", 0, false}, // bare number, no title
+		{"show s01e05", "", 0, false},
+		{"", "", 0, false},
+	}
+	for _, c := range cases {
+		title, abs, ok := SplitAbsoluteEpisode(c.in)
+		if title != c.title || abs != c.abs || ok != c.ok {
+			t.Errorf("SplitAbsoluteEpisode(%q) = (%q, %d, %v), want (%q, %d, %v)",
+				c.in, title, abs, ok, c.title, c.abs, c.ok)
+		}
+	}
+}
+
+func TestAnimeName(t *testing.T) {
+	inf := Info{Quality: "1080p", Codec: "x264", Audio: "SoftSub", Source: "Web-DL"}
+	if got, want := AnimeName("One Piece", 1090, inf), "One.Piece.1090.1080p.Web-DL.x264.FILM2MZ"; got != want {
+		t.Errorf("AnimeName = %q, want %q", got, want)
+	}
+	if got := AnimeName("Naruto", 45, inf); got != "Naruto.045.1080p.Web-DL.x264.FILM2MZ" {
+		t.Errorf("AnimeName pads to 3 digits, got %q", got)
+	}
+}
+
 func TestCategory(t *testing.T) {
 	cases := []struct {
 		kind    string

@@ -30,6 +30,8 @@ var (
 	reMultiSpace   = regexp.MustCompile(`\s+`)
 	reTitleChars   = regexp.MustCompile(`[^A-Za-z0-9 \-]+`)
 	reTitleSpaces  = regexp.MustCompile(`\s+`)
+	// Trailing bare number in an anime-style query, e.g. "one piece 1090".
+	reAbsEp = regexp.MustCompile(`^(.*\S)\s+(\d{2,4})$`)
 )
 
 // Parse extracts quality/codec/audio/source (+ season for episodes) from a
@@ -89,6 +91,37 @@ func CleanQuery(q string) string {
 	return strings.TrimSpace(q)
 }
 
+// HasYear reports whether the query carries a year token (19xx/20xx).
+func HasYear(q string) bool { return reQueryYear.MatchString(q) }
+
+// Normalize maps release-style separators to spaces without dropping any
+// tokens. Used to query the site with the year kept: film2mz's search returns
+// only ~10 results and ranks on the full string, so "Michael 2026" must reach
+// it intact — cleaned to "Michael" the right movie falls out of the window.
+func Normalize(q string) string {
+	q = strings.ReplaceAll(q, ".", " ")
+	q = strings.ReplaceAll(q, "_", " ")
+	q = reMultiSpace.ReplaceAllString(q, " ")
+	return strings.TrimSpace(q)
+}
+
+// SplitAbsoluteEpisode detects an anime-style query — Sonarr searches anime
+// as "<title> <absolute-episode>" with no season/ep params — and splits it
+// into the bare title and the episode number. Trailing numbers that look like
+// years (19xx/20xx) are treated as part of the title ("doctor who 2005"), not
+// as an episode.
+func SplitAbsoluteEpisode(q string) (title string, abs int, ok bool) {
+	m := reAbsEp.FindStringSubmatch(Normalize(q))
+	if m == nil || reQueryYear.MatchString(m[2]) {
+		return "", 0, false
+	}
+	n, _ := strconv.Atoi(m[2])
+	if n == 0 {
+		return "", 0, false
+	}
+	return m[1], n, true
+}
+
 // MovieName builds a Radarr-parseable release name.
 func MovieName(title string, year int, inf Info) string {
 	return buildName(title, year, "", inf)
@@ -102,6 +135,14 @@ func TVName(title string, year, season, episode int, inf Info) string {
 // SeasonPackName builds a Sonarr-parseable season-pack release name.
 func SeasonPackName(title string, year int, inf Info) string {
 	return buildName(title, year, fmt.Sprintf("S%02d", inf.Season), inf)
+}
+
+// AnimeName builds an absolute-numbered release name ("One.Piece.1090.1080p…")
+// for shows the site stores with absolute episode numbers. Sonarr's anime
+// parser reads the bare number as the absolute episode; the year is omitted so
+// it can't be mistaken for one.
+func AnimeName(title string, abs int, inf Info) string {
+	return buildName(title, 0, fmt.Sprintf("%03d", abs), inf)
 }
 
 func buildName(title string, year int, seToken string, inf Info) string {

@@ -157,6 +157,69 @@ func TestUIAction(t *testing.T) {
 	}
 }
 
+func TestBuildSearchQueries(t *testing.T) {
+	cases := []struct {
+		mode, q          string
+		season, ep, year int
+		wantVariants     []string
+		wantAbs          int
+	}{
+		// movie with embedded year: raw first, cleaned second
+		{"movie", "Michael 2026", 0, 0, 0, []string{"Michael 2026", "Michael"}, 0},
+		// movie with ?year= param: cleaned+year first
+		{"movie", "Michael", 0, 0, 2026, []string{"Michael 2026", "Michael"}, 0},
+		// anime absolute query: number split off, single variant
+		{"tvsearch", "one piece 1090", 0, 0, 0, []string{"one piece"}, 1090},
+		// standard tv search, no year: one site call, no raw variant
+		{"tvsearch", "Alice.in.Borderland.S01E05", 1, 5, 0, []string{"Alice in Borderland"}, 0},
+		// trailing year stays in the title for tv too
+		{"tvsearch", "doctor who 2005", 0, 0, 0, []string{"doctor who 2005", "doctor who"}, 0},
+		{"movie", "", 0, 0, 0, nil, 0},
+	}
+	for _, c := range cases {
+		variants, abs := buildSearchQueries(c.mode, c.q, c.season, c.ep, c.year)
+		if abs != c.wantAbs || len(variants) != len(c.wantVariants) {
+			t.Errorf("buildSearchQueries(%q, %q) = (%v, %d), want (%v, %d)", c.mode, c.q, variants, abs, c.wantVariants, c.wantAbs)
+			continue
+		}
+		for i := range variants {
+			if variants[i] != c.wantVariants[i] {
+				t.Errorf("buildSearchQueries(%q, %q) variant %d = %q, want %q", c.mode, c.q, i, variants[i], c.wantVariants[i])
+			}
+		}
+	}
+}
+
+func TestTVAbsoluteItems(t *testing.T) {
+	files := []film2.FileEntry{
+		{Name: "One.Piece.S01E1089.1080p.mkv", URL: "https://cdn.x/S01/One.Piece.S01E1089.1080p.mkv", Season: 1, Episode: 1089},
+		{Name: "One.Piece.S01E1090.1080p.mkv", URL: "https://cdn.x/S01/One.Piece.S01E1090.1080p.mkv", Season: 1, Episode: 1090},
+		{Name: "One.Piece.S01E1090.720p.Dubbed.mkv", URL: "https://cdn.x/S01/One.Piece.S01E1090.720p.Dubbed.mkv", Season: 1, Episode: 1090},
+		{Name: "One.Piece.S01E1090.mkv", URL: "https://cdn.x/S01/One.Piece.S01E1090.mkv", Season: 1, Episode: 1090}, // bare, dropped
+	}
+	hit := film2.SearchHit{IMDB: "tt0388629", Title: "One Piece", IsTV: true, URL: "https://site/one-piece", Year: 0}
+	s := testServer(t, &config.Config{})
+
+	items := s.itemsForHit(hit, files, 0, 0, 1090, "key", "http://pub")
+	if len(items) != 2 {
+		t.Fatalf("got %d items, want 2 (1080p + dubbed 720p): %+v", len(items), items)
+	}
+	for _, it := range items {
+		if !strings.Contains(it.Title, ".1090.") {
+			t.Errorf("item %q missing absolute episode token", it.Title)
+		}
+		if strings.Contains(it.Title, "S01E") {
+			t.Errorf("item %q uses SxxExx — Sonarr can't map that to TVDB numbering for anime", it.Title)
+		}
+		if it.Season != 0 || it.Episode != 0 {
+			t.Errorf("item %q carries season/episode attrs %d/%d, want none", it.Title, it.Season, it.Episode)
+		}
+	}
+	if items := s.itemsForHit(hit, files, 0, 0, 9999, "key", "http://pub"); len(items) != 0 {
+		t.Errorf("nonexistent absolute episode returned %d item(s)", len(items))
+	}
+}
+
 func TestTVItems(t *testing.T) {
 	files := []film2.FileEntry{
 		{Name: "Show.S01E01.1080p.x265.mkv", URL: "https://cdn.x/s1/Show.S01E01.1080p.x265.mkv", Season: 1, Episode: 1},
