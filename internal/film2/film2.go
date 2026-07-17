@@ -6,7 +6,9 @@ package film2
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -127,12 +129,13 @@ func (c *Client) Search(q string) ([]SearchHit, error) {
 		seen[r.URL] = true
 		hits = append(hits, SearchHit{
 			IMDB:  r.IMDB,
-			Title: htmlUnescape(strings.TrimSpace(r.Title)),
+			Title: html.UnescapeString(strings.TrimSpace(r.Title)),
 			IsTV:  strings.EqualFold(r.Type, "series"),
 			URL:   c.absURL(r.URL),
 			Year:  int(r.Year),
 		})
 	}
+	slog.Debug("film2 search", "q", q, "raw", len(raw), "hits", len(hits))
 	if len(hits) > 0 {
 		c.cache.Set(key, hits, c.ttl)
 	}
@@ -155,13 +158,14 @@ func (c *Client) PageFiles(pageURL string) ([]FileEntry, error) {
 	var files []FileEntry
 	seen := map[string]bool{}
 	for _, m := range reMediaURL.FindAllStringSubmatch(s, -1) {
-		u := htmlUnescape(m[1])
+		u := html.UnescapeString(m[1])
 		if seen[u] {
 			continue
 		}
 		seen[u] = true
 		files = append(files, fileEntryFromURL(u))
 	}
+	slog.Debug("film2 page scrape", "url", pageURL, "files", len(files))
 	if len(files) > 0 { // never cache a no-result scrape — likely transient
 		c.cache.Set(key, files, c.ttl)
 	}
@@ -218,16 +222,4 @@ func fileEntryFromURL(u string) FileEntry {
 		}
 	}
 	return f
-}
-
-func htmlUnescape(s string) string {
-	r := strings.NewReplacer(
-		"&amp;", "&",
-		"&lt;", "<",
-		"&gt;", ">",
-		"&quot;", "\"",
-		"&#39;", "'",
-		"&apos;", "'",
-	)
-	return r.Replace(s)
 }

@@ -33,7 +33,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -76,9 +76,15 @@ func main() {
 	flag.Parse()
 	cfg := configFromFlags()
 
+	lvl := slog.LevelInfo
+	if cfg.Debug {
+		lvl = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
+
 	up := upstream.New(cfg.UserAgent, cfg.Cookies, cfg.InsecureSkipVerify)
 	if cfg.InsecureSkipVerify {
-		log.Printf("WARNING: TLS verification disabled for upstream requests")
+		slog.Warn("TLS verification disabled for upstream requests")
 	}
 	site := film2.New(up, cfg.BaseURL, cfg.CacheTTL)
 
@@ -89,10 +95,11 @@ func main() {
 
 	if cfg.APIKey == "" {
 		cfg.APIKey = randomKey()
-		log.Printf("no -api-key supplied; generated ephemeral key: %s", cfg.APIKey)
+		slog.Warn("no -api-key supplied; generated ephemeral key", "key", cfg.APIKey)
 	}
 	if err := os.MkdirAll(cfg.DownloadDir, 0o755); err != nil {
-		log.Fatalf("download dir: %v", err)
+		slog.Error("download dir", "err", err)
+		os.Exit(1)
 	}
 	if abs, err := filepath.Abs(cfg.DownloadDir); err == nil {
 		cfg.DownloadDir = abs
@@ -120,14 +127,13 @@ func main() {
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
-	log.Printf("sonrad %s listening on %s", version, cfg.Addr)
-	log.Printf("download dir: %s", cfg.DownloadDir)
-	log.Printf("state file:   %s", cfg.StateFile)
-	log.Printf("api key:      %s", cfg.APIKey)
-	log.Printf("concurrency:  %d files, %d search, rate-limit %d B/s, retries %d",
-		cfg.MaxConcurrent, cfg.SearchConcurrency, cfg.RateLimit, cfg.DownloadRetries)
-	log.Printf("Newznab indexer URL: http://<host>%s/api  (apikey: %s)", cfg.Addr, cfg.APIKey)
-	log.Printf("SABnzbd base URL   : http://<host>%s/sabnzbd  (apikey: %s)", cfg.Addr, cfg.APIKey)
+	slog.Info("sonrad listening", "version", version, "addr", cfg.Addr)
+	slog.Info("download dir", "path", cfg.DownloadDir)
+	slog.Info("state file", "path", cfg.StateFile)
+	slog.Info("api key", "key", cfg.APIKey)
+	slog.Info("concurrency", "files", cfg.MaxConcurrent, "search", cfg.SearchConcurrency, "rate_limit", cfg.RateLimit, "retries", cfg.DownloadRetries)
+	slog.Info("Newznab indexer", "url", "http://<host>"+cfg.Addr+"/api")
+	slog.Info("SABnzbd client", "url", "http://<host>"+cfg.Addr+"/sabnzbd")
 
 	// Run the server in a goroutine so we can react to ctx cancellation.
 	errCh := make(chan error, 1)
@@ -139,16 +145,16 @@ func main() {
 
 	select {
 	case <-ctx.Done():
-		log.Printf("shutdown signal received, draining (timeout %s)…", cfg.ShutdownTimeout)
+		slog.Info("shutdown signal received, draining", "timeout", cfg.ShutdownTimeout)
 	case err := <-errCh:
-		log.Printf("server error: %v", err)
+		slog.Error("server error", "err", err)
 	}
 
 	// 1. stop accepting new HTTP requests, drain in-flight ones
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("http shutdown: %v", err)
+		slog.Warn("http shutdown", "err", err)
 	}
 
 	// 2. wait for download workers (ctx is already cancelled, they're aborting)
@@ -160,12 +166,12 @@ func main() {
 	select {
 	case <-done:
 	case <-shutdownCtx.Done():
-		log.Printf("workers didn't drain in time, forcing exit")
+		slog.Warn("workers didn't drain in time, forcing exit")
 	}
 
 	// 3. final state flush so a restart picks up where we left off
 	mgr.SaveNow()
-	log.Printf("bye")
+	slog.Info("bye")
 }
 
 func configFromFlags() *config.Config {
@@ -201,7 +207,8 @@ func randomKey() string {
 func testScrape(site *film2.Client, query string) {
 	hits, err := site.Search(release.CleanQuery(query))
 	if err != nil {
-		log.Fatalf("search: %v", err)
+		slog.Error("search", "err", err)
+		os.Exit(1)
 	}
 	fmt.Printf("Query: %q → %d hit(s)\n\n", query, len(hits))
 	for _, h := range hits {

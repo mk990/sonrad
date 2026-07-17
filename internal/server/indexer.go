@@ -2,7 +2,7 @@ package server
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -91,13 +91,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, mode strin
 	}
 
 	qstr := strings.TrimSpace(q.Get("q"))
-	log.Printf("search: t=%s q=%q season=%q ep=%q imdb=%q", mode, qstr, q.Get("season"), q.Get("ep"), imdb)
+	slog.Info("search", "t", mode, "q", qstr, "season", q.Get("season"), "ep", q.Get("ep"), "imdb", imdb)
 	var hits []film2.SearchHit
 	if qstr != "" {
 		var err error
 		hits, err = s.site.Search(release.CleanQuery(qstr))
 		if err != nil {
-			log.Printf("search %q: %v", qstr, err)
+			slog.Warn("search failed", "q", qstr, "err", err)
 		}
 	}
 
@@ -124,7 +124,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, mode strin
 	if len(imdbMatched) > 0 {
 		candidates = imdbMatched
 	} else if imdb != "" {
-		log.Printf("search: imdb=%q matched no hit; falling back to title matches", imdb)
+		slog.Info("search: imdb matched no hit; falling back to title matches", "imdb", imdb)
 	}
 	if len(candidates) > maxTitleSearchCandidates {
 		candidates = candidates[:maxTitleSearchCandidates]
@@ -152,14 +152,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, mode strin
 			defer func() { <-sem }()
 			files, err := s.site.PageFiles(h.URL)
 			if err != nil {
-				if s.cfg.Debug {
-					log.Printf("scrape %s: %v", h.URL, err)
-				}
+				slog.Debug("scrape failed", "url", h.URL, "err", err)
 				return
 			}
 			its := s.itemsForHit(h, files, wantSeason, wantEp, apikey, pub)
 			if len(its) == 0 {
-				log.Printf("search: %q (%s): scraped %d file(s) but 0 matched season=%d ep=%d — likely an episode-numbering mismatch", h.Title, h.URL, len(files), wantSeason, wantEp)
+				slog.Info("search: scraped files but none matched — likely an episode-numbering mismatch",
+					"title", h.Title, "url", h.URL, "files", len(files), "season", wantSeason, "ep", wantEp)
 			}
 			results[i] = result{title: h.Title, items: its}
 		}(i, h)
@@ -174,7 +173,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, mode strin
 		}
 		items = append(items, r.items...)
 	}
-	log.Printf("search: t=%s q=%q → %d candidate(s), %d item(s)", mode, qstr, len(candidates), len(items))
+	slog.Info("search done", "t", mode, "q", qstr, "candidates", len(candidates), "items", len(items))
 	respondXML(w, s.renderFeed(feedTitle, items))
 }
 

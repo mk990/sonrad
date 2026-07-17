@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,6 +21,7 @@ type Client struct {
 	cookies   string
 	scrape    *http.Client // short timeout — page scrapes and search calls
 	stream    *http.Client // no timeout — media downloads can take hours
+	lastOK    atomic.Int64 // unix time of the last successful upstream response
 }
 
 func New(userAgent, cookies string, insecureSkipVerify bool) *Client {
@@ -51,14 +53,34 @@ func (c *Client) decorate(req *http.Request) {
 // Do sends a scrape-class request (bounded by the client timeout).
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	c.decorate(req)
-	return c.scrape.Do(req)
+	resp, err := c.scrape.Do(req)
+	c.noteResult(resp, err)
+	return resp, err
 }
 
 // DoStream sends a request on the timeout-free client, for long downloads.
 // Cancellation comes from the request context instead.
 func (c *Client) DoStream(req *http.Request) (*http.Response, error) {
 	c.decorate(req)
-	return c.stream.Do(req)
+	resp, err := c.stream.Do(req)
+	c.noteResult(resp, err)
+	return resp, err
+}
+
+func (c *Client) noteResult(resp *http.Response, err error) {
+	if err == nil && resp.StatusCode < 400 {
+		c.lastOK.Store(time.Now().Unix())
+	}
+}
+
+// LastSuccess returns when the site/CDN last answered successfully (zero time
+// if never). Health checks use it to spot "site blocked us / cookies expired"
+// while the process itself is still fine.
+func (c *Client) LastSuccess() time.Time {
+	if v := c.lastOK.Load(); v > 0 {
+		return time.Unix(v, 0)
+	}
+	return time.Time{}
 }
 
 // GetBytes fetches a URL and returns its body (capped at 32 MiB).

@@ -223,13 +223,30 @@ which is what Sonarr/Radarr expect to import from.
   results via its `/quick-search` (which returns the IMDB id per hit). Caps
   advertise `q` only, so Sonarr/Radarr send the title; queries with an IMDB id
   but no title return empty.
-- **No state persistence** — queue/history live in memory. Restarting drops
-  in-flight jobs (resume is per-file via HTTP `Range`, so they pick up if
-  re-queued).
 - **HTML scraping** — if film2mz changes its `/quick-search` JSON or its page
   markup, the search decoder (`film2Result`) and the link regex (`reMediaURL`)
   are the only things to update.
 - **No subtitle sidecar download** — only video files are fetched.
+
+---
+
+## Operations
+
+- **Status page** — `GET /` auto-refreshes every 5 s with per-job progress,
+  speed and ETA. Without the API key it is read-only and the key is masked;
+  open `/?apikey=YOURKEY` to unlock pause/resume, delete and retry buttons.
+- **Pause / resume** — SABnzbd `mode=pause` / `mode=resume` (Sonarr/Radarr's
+  pause button) really pause the queue: no new file starts and in-flight
+  transfers stop pulling bytes.
+- **Retry** — `mode=retry&value=<nzo_id>` (or the Retry button) re-queues a
+  failed job from history; already-finished files resume via HTTP `Range`.
+- **Disk space** — the SABnzbd API reports real free/total space of the
+  download filesystem, so the arrs' free-space checks work.
+- **Truncation guard** — a transfer that ends short of the advertised size is
+  retried (resuming), never imported as complete.
+- **Monitoring** — `GET /healthz` (queue length, speed, paused, last successful
+  upstream contact) and `GET /metrics` (Prometheus text format).
+- **Logging** — structured `log/slog`; `-debug` enables scrape-level detail.
 
 ---
 
@@ -242,7 +259,10 @@ which is what Sonarr/Radarr expect to import from.
 | `GET /api?t=tvsearch&q=…&season=…&ep=…` | Sonarr | TV search |
 | `GET /getnzb?token=…&apikey=…`  | Sonarr/Radarr | fetch fake NZB |
 | `/sabnzbd/api?mode=…` | Sonarr/Radarr          | SABnzbd-compatible client API |
-| `GET /`               | you                    | live status page |
+| `GET /`               | you                    | live status page (actions with `?apikey=…`) |
+| `POST /ui/action`     | status page buttons    | pause/resume/delete/retry (key required) |
+| `GET /healthz`        | Docker/k8s/monitors    | liveness + queue/upstream health |
+| `GET /metrics`        | Prometheus             | metrics in text exposition format |
 
 ---
 

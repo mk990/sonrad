@@ -34,6 +34,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/sabnzbd/api", s.handleSABnzbd)
 	mux.HandleFunc("/sabnzbd/api/", s.handleSABnzbd)
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/ui/action", s.handleUIAction)
 	mux.HandleFunc("/", s.handleIndex)
 	return mux
 }

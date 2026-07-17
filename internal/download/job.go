@@ -87,13 +87,23 @@ type View struct {
 	StoragePath string
 	FailMessage string
 	SpeedBPS    float64
+	Files       []FileView
+}
+
+// FileView is the per-file slice of a View.
+type FileView struct {
+	Filename  string
+	Bytes     int64
+	BytesDone int64
+	Status    string
+	Error     string
 }
 
 // View snapshots the job under its lock.
 func (j *Job) View() View {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return View{
+	v := View{
 		ID:          j.ID,
 		Name:        j.Name,
 		Category:    j.Category,
@@ -106,6 +116,16 @@ func (j *Job) View() View {
 		FailMessage: j.FailMessage,
 		SpeedBPS:    j.speedBPS,
 	}
+	for _, f := range j.Files {
+		v.Files = append(v.Files, FileView{
+			Filename:  f.Filename,
+			Bytes:     f.Bytes,
+			BytesDone: f.BytesDone,
+			Status:    f.Status,
+			Error:     f.Error,
+		})
+	}
+	return v
 }
 
 // recordProgress is called whenever `n` more bytes have been pulled for `f`.

@@ -42,6 +42,14 @@ func (s *Server) handleSABnzbd(w http.ResponseWriter, r *http.Request) {
 		s.sabAddFile(w, r)
 	case "delete":
 		s.sabDelete(w, r)
+	case "pause":
+		s.mgr.Pause()
+		writeJSON(w, 200, map[string]any{"status": true})
+	case "resume":
+		s.mgr.Resume()
+		writeJSON(w, 200, map[string]any{"status": true})
+	case "retry":
+		s.sabRetry(w, r)
 	case "get_cats":
 		writeJSON(w, 200, map[string]any{"categories": []string{"*", "movies", "tv"}})
 	case "get_scripts":
@@ -52,7 +60,7 @@ func (s *Server) handleSABnzbd(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"warnings": []any{}})
 	case "server_stats":
 		writeJSON(w, 200, map[string]any{"total": 0, "month": 0, "week": 0, "day": 0})
-	default: // shutdown, restart, pause, resume, anything unknown
+	default: // shutdown, restart, anything unknown
 		writeJSON(w, 200, map[string]any{"status": true})
 	}
 }
@@ -83,14 +91,15 @@ func (s *Server) sabGetConfig(w http.ResponseWriter) {
 }
 
 func (s *Server) sabFullStatus(w http.ResponseWriter) {
+	free, total := diskspaceGB(s.cfg.DownloadDir)
 	writeJSON(w, 200, map[string]any{
 		"status": map[string]any{
-			"paused":          false,
+			"paused":          s.mgr.Paused(),
 			"pause_int":       "0",
-			"diskspace1":      "1000.0",
-			"diskspace2":      "1000.0",
-			"diskspacetotal1": "1000.0",
-			"diskspacetotal2": "1000.0",
+			"diskspace1":      fmt.Sprintf("%.2f", free),
+			"diskspace2":      fmt.Sprintf("%.2f", free),
+			"diskspacetotal1": fmt.Sprintf("%.2f", total),
+			"diskspacetotal2": fmt.Sprintf("%.2f", total),
 			"speedlimit":      "0",
 			"speedlimit_abs":  "0",
 			"have_warnings":   "0",
@@ -98,6 +107,16 @@ func (s *Server) sabFullStatus(w http.ResponseWriter) {
 			"uptime":          "0",
 		},
 	})
+}
+
+// sabRetry re-queues a failed history job (mode=retry&value=<nzo_id>).
+func (s *Server) sabRetry(w http.ResponseWriter, r *http.Request) {
+	id := firstNonEmpty(r.URL.Query().Get("value"), r.FormValue("value"))
+	if id == "" || !s.mgr.Retry(id) {
+		writeJSON(w, 200, map[string]any{"status": false, "error": "no such job"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"status": true, "nzo_id": id})
 }
 
 func (s *Server) sabQueue(w http.ResponseWriter) {
@@ -143,10 +162,15 @@ func (s *Server) sabQueue(w http.ResponseWriter) {
 	if totalSpeed > 0 {
 		timeLeft = formatHMS(int64(float64(left) / totalSpeed))
 	}
+	status := "Downloading"
+	if s.mgr.Paused() {
+		status = "Paused"
+	}
+	free, total := diskspaceGB(s.cfg.DownloadDir)
 	writeJSON(w, 200, map[string]any{
 		"queue": map[string]any{
-			"status":          "Downloading",
-			"paused":          false,
+			"status":          status,
+			"paused":          s.mgr.Paused(),
 			"noofslots":       len(slots),
 			"noofslots_total": len(slots),
 			"limit":           100,
@@ -157,10 +181,10 @@ func (s *Server) sabQueue(w http.ResponseWriter) {
 			"kbpersec":        fmt.Sprintf("%.1f", totalSpeed/1024),
 			"timeleft":        timeLeft,
 			"slots":           slots,
-			"diskspace1":      "1000.0",
-			"diskspace2":      "1000.0",
-			"diskspacetotal1": "1000.0",
-			"diskspacetotal2": "1000.0",
+			"diskspace1":      fmt.Sprintf("%.2f", free),
+			"diskspace2":      fmt.Sprintf("%.2f", free),
+			"diskspacetotal1": fmt.Sprintf("%.2f", total),
+			"diskspacetotal2": fmt.Sprintf("%.2f", total),
 			"version":         sabVersion,
 		},
 	})
@@ -281,7 +305,7 @@ func (s *Server) sabDelete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) sabQStatus(w http.ResponseWriter) {
 	queue, _ := s.mgr.Snapshot()
 	writeJSON(w, 200, map[string]any{
-		"paused":    false,
+		"paused":    s.mgr.Paused(),
 		"kbpersec":  0.0,
 		"mb":        0.0,
 		"mbleft":    0.0,

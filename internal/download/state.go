@@ -3,7 +3,7 @@ package download
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"os"
 	"time"
 )
@@ -105,16 +105,16 @@ func (m *Manager) SaveNow() {
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
-		log.Printf("state save: marshal: %v", err)
+		slog.Error("state save: marshal failed", "err", err)
 		return
 	}
 	tmp := m.opts.StateFile + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		log.Printf("state save: write %s: %v", tmp, err)
+		slog.Error("state save: write failed", "path", tmp, "err", err)
 		return
 	}
 	if err := os.Rename(tmp, m.opts.StateFile); err != nil {
-		log.Printf("state save: rename: %v", err)
+		slog.Error("state save: rename failed", "err", err)
 	}
 }
 
@@ -145,13 +145,13 @@ func (m *Manager) LoadState() {
 	data, err := os.ReadFile(m.opts.StateFile)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			log.Printf("state load: %v", err)
+			slog.Error("state load failed", "err", err)
 		}
 		return
 	}
 	var st savedState
 	if err := json.Unmarshal(data, &st); err != nil {
-		log.Printf("state load: corrupt %s: %v (ignoring)", m.opts.StateFile, err)
+		slog.Warn("state load: corrupt state file, ignoring", "path", m.opts.StateFile, "err", err)
 		return
 	}
 	m.mu.Lock()
@@ -173,5 +173,5 @@ func (m *Manager) LoadState() {
 		}
 		m.Add(j)
 	}
-	log.Printf("state load: %d queued (resuming), %d history", len(st.Queue), len(st.History))
+	slog.Info("state loaded", "queued", len(st.Queue), "history", len(st.History))
 }
